@@ -1,0 +1,16 @@
+{
+  "scene": "Demo",
+  "layer": "drivable",
+  "frame": "ros_world (x=Unity z, y=-Unity x)",
+  "resolution_m_per_px": 0.1,
+  "lane_width_m": 8,
+  "bridged_connections": true,
+  "fill_radius_px": 4,
+  "width_px": 2443,
+  "height_px": 6399,
+  "world_bounds_ros": {"x_min": 44.09175, "x_max": 288.356171, "y_min": -264.6579, "y_max": 375.214874},
+  "world_bounds_unity": {"x_min": -375.214874, "x_max": 264.6579, "z_min": 44.09175, "z_max": 288.356171},
+  "homography_world_to_px": [[10, 0, -440.9175], [0, -10, 3752.14868], [0, 0, 1]],
+  "drivable_value": "white(255)",
+  "note": "PNG pixel origin is top-left (y-down). Row 0 of the PNG is ry_max."
+}

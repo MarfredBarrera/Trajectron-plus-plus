@@ -1,0 +1,24 @@
+# sweep_s1_rail WITH the drivable/occupancy map (see config.yaml for key docs).
+# Paired with sweep_s1_rail_nomap.yaml for the map-effect comparison.
+data_dir: unity_data/sweep_s1_rail
+
+model_dir: ../nuScenes/models/int_ee_me
+model_ts: 12
+
+stride: 5
+ph: 10
+num_samples: 1000
+
+frame_stride: 1
+single_t: null
+ego_frame: false
+zoom: 80.0
+fps: 2.0
+
+out_dir: unity_out/sweep_s1_rail_mapcmp
+pred_file: unity_out/sweep_s1_rail_mapcmp/pred_map.pkl
+save_env: false
+no_viz: true
+
+map_png: unity_maps/Demo_drivable.png
+map_json: unity_maps/Demo_drivable.json

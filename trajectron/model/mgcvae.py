@@ -1112,7 +1112,12 @@ class MultimodalGenerativeCVAE(object):
         :param gmm_mode: If True: The mode of the GMM is sampled.
         :param all_z_sep: Samples each latent mode individually without merging them into a GMM.
         :param full_dist: Samples all latent states and merges them into a GMM as output.
-        :return:
+        :return: tuple(y_dist, our_sampled_future)
+            WHERE
+            - y_dist: GMM2D over future positions (analytic mean/covariance, propagated
+              through the dynamics model -- exact for linear dynamics, EKF-linearized
+              for nonlinear ones like Unicycle).
+            - our_sampled_future: Monte Carlo position samples drawn from y_dist.
         """
         mode = ModeKeys.PREDICT
 
@@ -1134,10 +1139,10 @@ class MultimodalGenerativeCVAE(object):
                                                               full_dist=full_dist,
                                                               all_z_sep=all_z_sep)
 
-        _, our_sampled_future = self.p_y_xz(mode, x, x_nr_t, y_r, n_s_t0, z,
-                                            prediction_horizon,
-                                            num_samples,
-                                            num_components,
-                                            gmm_mode)
+        y_dist, our_sampled_future = self.p_y_xz(mode, x, x_nr_t, y_r, n_s_t0, z,
+                                                 prediction_horizon,
+                                                 num_samples,
+                                                 num_components,
+                                                 gmm_mode)
 
-        return our_sampled_future
+        return y_dist, our_sampled_future

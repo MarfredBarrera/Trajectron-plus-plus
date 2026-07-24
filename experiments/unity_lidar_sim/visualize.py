@@ -25,12 +25,14 @@ def main():
                    help='output directory (default: the bundle file\'s directory)')
     p.add_argument('--ego_frame', action='store_true', help='render in the ego frame (if ego stored)')
     p.add_argument('--zoom', type=float, default=None, help='ego-frame half-window in metres')
-    p.add_argument('--fps', type=float, default=5.0, help='video playback frame rate')
+    p.add_argument('--fps', type=float, default=2.0, help='video playback frame rate')
     p.add_argument('--format', default='gif', choices=['gif', 'mp4', 'both'],
                    help='output video format(s)')
     p.add_argument('--style', default='samples', choices=['samples', 'gaussian', 'both'],
                    help='how to draw the distribution: sample fan, Gaussian blobs, or both')
     p.add_argument('--single', action='store_true', help='render only the first frame (debug, no video)')
+    p.add_argument('--workers', type=int, default=None,
+                   help='parallel render processes (default: auto; rendering is CPU/matplotlib, not GPU)')
     args = p.parse_args()
 
     bundle = load_bundle(args.pred_file)
@@ -38,7 +40,8 @@ def main():
     print(f'Loaded {len(bundle["frames"])} frames from {args.pred_file}  '
           f'(scene {bundle["meta"].get("scene")}, source {bundle["meta"].get("source")})')
     render_bundle(bundle, out_dir, ego_frame=args.ego_frame, fps=args.fps,
-                  zoom=args.zoom, single=args.single, fmt=args.format, style=args.style)
+                  zoom=args.zoom, single=args.single, fmt=args.format, style=args.style,
+                  workers=args.workers)
 
 
 if __name__ == '__main__':

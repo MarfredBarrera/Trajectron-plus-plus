@@ -14,7 +14,9 @@ Bundle format (pickle):
                   'ego': [[ex, ey], yaw] or None,      # world coords; enables ego view
                   'nodes': [ {'id', 'type',
                               'history' (H,2), 'future' (F,2),
-                              'samples' (S,ph,2), 'ml' (ph,2)}, ... ]}, ... ]}
+                              'samples' (S,ph,2), 'ml' (ph,2),
+                              'dist_mus' (ph,K,2), 'dist_covs' (ph,K,2,2), 'dist_pis' (ph,K)},
+                             ... ]}, ... ]}
 
 All node arrays are in SCENE-LOCAL coords; meta['x_min'/'y_min'] shift them to world.
 Whether a frame is drawn in world or ego view is a *render-time* choice -- the ego pose
@@ -31,6 +33,7 @@ import matplotlib.patheffects as pe
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Ellipse, Patch
 from matplotlib.lines import Line2D
+from matplotlib.transforms import Affine2D
 from PIL import Image
 
 # distinct colors cycled per agent
@@ -60,7 +63,15 @@ def ego_transform(ego_pos, ego_yaw):
     R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
     def f(world_pts):
         return (np.atleast_2d(world_pts) - np.asarray(ego_pos)) @ R.T
+    f.R = R  # exposed so covariance matrices can be rotated the same way as points
     return f
+
+
+def _identity_transform(p):
+    return np.atleast_2d(p)
+
+
+_identity_transform.R = np.eye(2)
 
 
 def _color_for(node_id, order):
@@ -72,32 +83,75 @@ def _color_for(node_id, order):
 def _draw_sample_fan(ax, hist, s, c):
     """Each sample as a thin translucent trajectory from the current position through
     the horizon (line density = probability mass)."""
+    if s.size == 0:   # bundle produced with --style gaussian: no samples were stored
+        return
     cur = np.broadcast_to(hist[-1], (s.shape[0], 1, 2))
     sample_lines = np.concatenate([cur, s], axis=1)         # (num_samples, ph+1, 2)
     ax.add_collection(LineCollection(sample_lines, colors=c, linewidths=0.5,
                                      alpha=0.06, zorder=400))
 
 
-def _draw_gaussian_blobs(ax, hist, s, c, n_stds=(1.0, 2.0)):
-    """Per-horizon-step Gaussian blob: at each future step, the sample cloud's mean and
-    covariance -> a shaded covariance ellipse (this is the GMM's moment-matched mean/cov
-    in position space). `s` is already in plot coords: (num_samples, ph, 2)."""
-    if s.shape[0] < 3:
-        return
-    means = s.mean(axis=0)                                  # (ph, 2)
-    for k in range(s.shape[1]):
-        pts = s[:, k, :]
-        cov = np.cov(pts.T)
-        vals, vecs = np.linalg.eigh(cov)
-        vals = np.clip(vals, 1e-9, None)
-        angle = np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1]))   # largest-eigenvalue axis
-        for ns in n_stds:
-            ax.add_patch(Ellipse(means[k], 2 * ns * np.sqrt(vals[1]), 2 * ns * np.sqrt(vals[0]),
-                                 angle=angle, facecolor=c, edgecolor='none',
-                                 alpha=0.10, zorder=380))
-    # mean trajectory through the blobs
-    mp = np.vstack([hist[-1], means])
+def _draw_gaussian_blobs(ax, hist, dist_mus, dist_covs, dist_pis, transform, c,
+                         n_stds=(1.0, 2.0), pi_threshold=0.05):
+    """Per-horizon-step Gaussian blobs drawn straight from the decoder/GMM's own analytic
+    parameters (mean + covariance propagated through the dynamics model), not estimated
+    from sample statistics. `dist_mus` is already in plot coords: (ph, K, 2); `dist_covs`
+    is raw scene-local covariance (ph, K, 2, 2) -- rotated (not translated) into plot
+    coords using `transform.R`; `dist_pis` (ph, K) are the mixture weights (components
+    below `pi_threshold` are skipped as visual clutter, not part of the actual math)."""
+    R = transform.R
+    ph, K = dist_pis.shape
+    mean_path = [hist[-1]]
+    for t in range(ph):
+        # pi-weighted mean over *all* components, independent of the drawing threshold
+        mean_path.append(np.sum(dist_pis[t][:, None] * dist_mus[t], axis=0))
+        for k in range(K):
+            if dist_pis[t, k] < pi_threshold:
+                continue
+            cov = R @ dist_covs[t, k] @ R.T
+            vals, vecs = np.linalg.eigh(cov)
+            vals = np.clip(vals, 1e-9, None)
+            angle = np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1]))   # largest-eigenvalue axis
+            for ns in n_stds:
+                ax.add_patch(Ellipse(dist_mus[t, k], 2 * ns * np.sqrt(vals[1]), 2 * ns * np.sqrt(vals[0]),
+                                     angle=angle, facecolor=c, edgecolor='none',
+                                     alpha=0.10, zorder=380))
+    mp = np.vstack(mean_path)
     ax.plot(mp[:, 0], mp[:, 1], '-', color=c, lw=0.9, alpha=0.6, zorder=545)
+
+
+def _draw_map_background(ax, map_rgba, bounds, ego=None, crop_radius=None):
+    """Shade the non-drivable area under the trajectories (see unity_maps/handoff.md);
+    drivable pixels are fully transparent so the ribbon itself stays visually clean --
+    it's a soft prior for the model, not a hard mask, and the viz treats it the same way.
+    World view: axis-aligned imshow at the raster's native extent. Ego view: crop around
+    the ego position first (the raster covers far more area than one zoom window) then
+    rotate the crop the same way `ego_transform` rotates points, via an Affine2D transform
+    on the image artist."""
+    if map_rgba is None or bounds is None:
+        return
+    x0, x1, y0, y1 = bounds
+    h, w = map_rgba.shape[:2]
+    if ego is None:
+        ax.imshow(map_rgba, extent=(x0, x1, y0, y1), origin='upper', zorder=0)
+        return
+
+    ego_pos, ego_yaw = ego
+    r = crop_radius or 200.0
+    px_x, px_y = w / (x1 - x0), h / (y1 - y0)
+    col0 = int(np.clip((ego_pos[0] - r - x0) * px_x, 0, w))
+    col1 = int(np.clip((ego_pos[0] + r - x0) * px_x, 0, w))
+    row0 = int(np.clip((y1 - (ego_pos[1] + r)) * px_y, 0, h))
+    row1 = int(np.clip((y1 - (ego_pos[1] - r)) * px_y, 0, h))
+    if col1 <= col0 or row1 <= row0:
+        return   # ego is entirely outside the mapped area
+    crop = map_rgba[row0:row1, col0:col1]
+    cx0, cx1 = x0 + col0 / px_x, x0 + col1 / px_x
+    cy0, cy1 = y1 - row1 / px_y, y1 - row0 / px_y
+
+    a = np.pi / 2.0 - ego_yaw     # same rotation ego_transform applies to points
+    tr = Affine2D().translate(-ego_pos[0], -ego_pos[1]).rotate(a) + ax.transData
+    ax.imshow(crop, extent=(cx0, cx1, cy0, cy1), origin='upper', zorder=0, transform=tr)
 
 
 def draw_frame(ax, record, off, transform, order, style='samples'):
@@ -122,7 +176,8 @@ def draw_frame(ax, record, off, transform, order, style='samples'):
         if style in ('samples', 'both'):
             _draw_sample_fan(ax, hist, s, c)
         if style in ('gaussian', 'both'):
-            _draw_gaussian_blobs(ax, hist, s, c)
+            dm = to_plot(nd['dist_mus'])    # (ph, K, 2); covariance is rotated, not offset
+            _draw_gaussian_blobs(ax, hist, dm, nd['dist_covs'], nd['dist_pis'], transform, c)
         # most-likely path
         ax.plot(*np.vstack([hist[-1], mm]).T, '-', color=c, lw=1.6, zorder=550)
         # GT future
@@ -134,18 +189,22 @@ def draw_frame(ax, record, off, transform, order, style='samples'):
                    linewidths=0.6, zorder=650)
 
 
-def render_frame_to_file(record, meta, out_path, order, ego_frame=False, zoom=None, style='samples'):
+def render_frame_to_file(record, meta, out_path, order, ego_frame=False, zoom=None, style='samples',
+                         map_rgba=None, map_bounds=None):
     """Render one stored frame record to an image. Returns True."""
     ego = record.get('ego')
     use_ego = ego_frame and ego is not None
     if zoom is None:
         zoom = meta.get('zoom', 60.0)
     off = np.array([meta.get('x_min', 0.0), meta.get('y_min', 0.0)])
-    transform = ego_transform(np.array(ego[0]), ego[1]) if use_ego else (lambda p: np.atleast_2d(p))
+    transform = ego_transform(np.array(ego[0]), ego[1]) if use_ego else _identity_transform
     t, dtv = record['t'], meta.get('dt', 0.5)
 
     fig, ax = plt.subplots(figsize=(12, 12) if use_ego else (11, 13))
     ax.set_facecolor("#FFFFFF")
+
+    map_ego = (np.array(ego[0]), ego[1]) if use_ego else None
+    _draw_map_background(ax, map_rgba, map_bounds, ego=map_ego, crop_radius=zoom * 1.6 if use_ego else None)
 
     draw_frame(ax, record, off, transform, order, style=style)
 
@@ -162,10 +221,6 @@ def render_frame_to_file(record, meta, out_path, order, ego_frame=False, zoom=No
     if use_ego:
         ax.scatter([0], [0], marker='^', s=260, color="#FF0000", edgecolors='k',
                    linewidths=1.0, zorder=800)
-        for r in range(10, int(zoom) + 1, 10):
-            ax.add_patch(plt.Circle((0, 0), r, fill=False, color='#333', lw=0.6, zorder=100))
-        ax.axhline(0, color='#333', lw=0.5, zorder=90)
-        ax.axvline(0, color='#333', lw=0.5, zorder=90)
         ax.set_xlim(-zoom, zoom); ax.set_ylim(-zoom, zoom)
         ax.set_xlabel('ego x (right) [m]'); ax.set_ylabel('ego y (forward) [m]')
         title = f'Trajectron++ distribution (ego frame)  |  t = {t}  ({t * dtv:.1f}s)'
@@ -176,7 +231,8 @@ def render_frame_to_file(record, meta, out_path, order, ego_frame=False, zoom=No
 
     ax.set_aspect('equal')
     ax.set_title(title, fontsize=14)
-    ax.legend(handles=handles, loc='upper right', fontsize=11, frameon=True, facecolor='white')
+    leg = ax.legend(handles=handles, loc='upper right', fontsize=11, frameon=True, facecolor='white')
+    leg.set_zorder(1000)   # keep the legend above every trajectory/blob artist
     fig.savefig(out_path, dpi=90, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     return True
@@ -220,8 +276,62 @@ def _assemble(paths, out_dir, prefix, ego_frame, fps, fmt):
     return outputs
 
 
-def render_bundle(bundle, out_dir, ego_frame=False, fps=5.0, zoom=None, single=False,
-                  fmt='gif', style='samples'):
+def _build_map_rgba(meta, target_long_px=1600):
+    """Build the non-drivable shading overlay once, downsampled so imshow is cheap.
+
+    The native drivable raster is ~15.6 MP but a rendered frame is only ~1000 px wide, so
+    imshow resamples the whole thing every frame (~0.5 s each) for no visible gain. We
+    downsample to `target_long_px` on the long side (extent/world coords are unchanged --
+    only pixel resolution drops), which also shrinks what gets shipped to render workers.
+    Alpha is area-averaged (BOX) so thin non-drivable seams stay visible."""
+    map_png = meta.get('map_png')
+    if not map_png or not os.path.exists(map_png):
+        return None, None
+    gray = np.asarray(Image.open(map_png).convert('L'))
+    h, w = gray.shape
+    f = max(1, int(round(max(h, w) / float(target_long_px))))
+    if f > 1:
+        alpha = np.asarray(Image.fromarray(np.where(gray < 127, 100, 0).astype(np.uint8))
+                           .resize((w // f, h // f), Image.BOX))
+    else:
+        alpha = np.where(gray < 127, 100, 0).astype(np.uint8)
+    map_rgba = np.zeros(alpha.shape + (4,), dtype=np.uint8)
+    map_rgba[..., :3] = 90
+    map_rgba[..., 3] = alpha
+    return map_rgba, meta.get('map_bounds')
+
+
+def _precompute_order(frames):
+    """Global node_id -> color index by first appearance (frame, then node order), so every
+    frame -- including ones rendered in parallel worker processes -- colors agents the same."""
+    order = {}
+    for rec in frames:
+        for nd in rec['nodes']:
+            _color_for(nd['id'], order)
+    return order
+
+
+# per-worker read-only state, set once by the pool initializer to avoid re-pickling the
+# map raster / meta / color map for every frame.
+_WORKER = {}
+
+
+def _render_init(meta, map_rgba, map_bounds, order, frame_dir, ego_frame, zoom, style):
+    _WORKER.update(meta=meta, map_rgba=map_rgba, map_bounds=map_bounds, order=dict(order),
+                   frame_dir=frame_dir, ego_frame=ego_frame, zoom=zoom, style=style)
+
+
+def _render_one(rec):
+    w = _WORKER
+    out = os.path.join(w['frame_dir'], f"frame_{rec['t']:04d}.png")
+    render_frame_to_file(rec, w['meta'], out, w['order'], ego_frame=w['ego_frame'],
+                         zoom=w['zoom'], style=w['style'], map_rgba=w['map_rgba'],
+                         map_bounds=w['map_bounds'])
+    return out
+
+
+def render_bundle(bundle, out_dir, ego_frame=False, fps=2.0, zoom=None, single=False,
+                  fmt='gif', style='samples', workers=None):
     """Render every frame in a bundle to PNGs (in a mode-specific subdir) + a GIF and/or
     MP4 (`fmt` in {gif, mp4, both}). `style` in {samples, gaussian, both} picks how the
     predicted distribution is drawn. If `single`, write one PNG into out_dir, no video."""
@@ -230,25 +340,49 @@ def render_bundle(bundle, out_dir, ego_frame=False, fps=5.0, zoom=None, single=F
         print('No frames in bundle.')
         return None
     os.makedirs(out_dir, exist_ok=True)
-    order = {}
+
+    # global color map + drivable-map background, both built once and reused for every
+    # frame (see unity_maps/handoff.md). Only non-drivable pixels get an alpha tint, so the
+    # drivable ribbon itself stays clean.
+    order = _precompute_order(frames)
+    map_rgba, map_bounds = _build_map_rgba(meta)
 
     if single:
         rec = frames[0]
         mode = 'ego' if ego_frame else 'world'
         out = os.path.join(out_dir, f"frame_{rec['t']:04d}_{mode}_{style}.png")
-        render_frame_to_file(rec, meta, out, order, ego_frame=ego_frame, zoom=zoom, style=style)
+        render_frame_to_file(rec, meta, out, order, ego_frame=ego_frame, zoom=zoom, style=style,
+                             map_rgba=map_rgba, map_bounds=map_bounds)
         print(f'Rendered -> {out}')
         return out
 
     frame_dir = os.path.join(out_dir, 'frames_ego' if ego_frame else 'frames_world')
     os.makedirs(frame_dir, exist_ok=True)
-    paths = []
-    for i, rec in enumerate(frames):
-        out = os.path.join(frame_dir, f"frame_{rec['t']:04d}.png")
-        render_frame_to_file(rec, meta, out, order, ego_frame=ego_frame, zoom=zoom, style=style)
-        paths.append(out)
-        print(f'  render [{i + 1}/{len(frames)}] t={rec["t"]}', end='\r', flush=True)
-    print()
+
+    # rendering is matplotlib/CPU (no GPU) and each frame is independent, so fan the frames
+    # out across processes. `workers` None -> auto (capped so we don't hog a shared box).
+    if workers is None:
+        workers = min(len(frames), (os.cpu_count() or 1), 32)
+    workers = max(1, int(workers))
+    paths = [os.path.join(frame_dir, f"frame_{rec['t']:04d}.png") for rec in frames]
+
+    if workers == 1:
+        for i, rec in enumerate(frames):
+            render_frame_to_file(rec, meta, paths[i], order, ego_frame=ego_frame, zoom=zoom,
+                                 style=style, map_rgba=map_rgba, map_bounds=map_bounds)
+            print(f'  render [{i + 1}/{len(frames)}] t={rec["t"]}', end='\r', flush=True)
+        print()
+    else:
+        import concurrent.futures as cf
+        print(f'  rendering {len(frames)} frames across {workers} processes...')
+        with cf.ProcessPoolExecutor(
+                max_workers=workers, initializer=_render_init,
+                initargs=(meta, map_rgba, map_bounds, order, frame_dir, ego_frame, zoom, style)) as ex:
+            done = 0
+            for _ in ex.map(_render_one, frames):
+                done += 1
+                print(f'  render [{done}/{len(frames)}]', end='\r', flush=True)
+        print()
 
     prefix = meta.get('gif_prefix', 'distribution')
     return _assemble(paths, out_dir, prefix, ego_frame, fps, fmt)

@@ -1,0 +1,40 @@
+# Scene / model / render configuration for unity_predict.py.
+# Command-line flags stay limited to what actually changes run-to-run
+# (--gpu, --style, --format); everything else lives here. To run a
+# different scene, either edit data_dir below or copy this file and pass
+# --config my_scene.yaml.
+
+# Directory containing gt_agents.json + poses.csv for one scene.
+data_dir: unity_data/sweep_s1_hdl_frame_fixed
+
+# Pre-trained model (weights are only trained at 2Hz, see stride below).
+model_dir: ../nuScenes/models/int_ee_me
+model_ts: 12
+
+stride: 5              # resample source frames (10Hz) -> 2Hz
+ph: 6                   # prediction horizon, steps @2Hz (6 = 3s)
+num_samples: 200        # Monte Carlo samples per predicted node
+
+frame_stride: 1         # render every k-th timestep in the video
+single_t: null          # render just one timestep (debug); null = full video
+ego_frame: false        # render zoomed-in, ego at origin heading up
+zoom: 80.0               # ego-frame half-window in metres
+fps: 5.0                  # output video frame rate
+
+out_dir: null             # null = unity_out/<data_dir name>
+pred_file: null            # null = <out_dir>/predictions.pkl
+save_env: false            # also dump the built Environment pkl
+no_viz: false                # predict only, skip rendering (re-render later with visualize.py)
+
+# Drivable/undrivable raster for the VEHICLE map encoder + viz backdrop (see
+# unity_maps/handoff.md). It's a soft prior, not a hard mask -- the model can still place
+# probability mass off it (e.g. an ambulance cutting across lanes), just less likely.
+# Set either to null to fall back to a blank (uninformative) map.
+map_png: unity_maps/Demo_drivable.png
+map_json: unity_maps/Demo_drivable.json
+
+# Whether to feed the drivable map to the MODEL's map encoder. Set false to run inference
+# on a blank map (kinematics + interactions only) while STILL drawing the drivable raster
+# as the visualization backdrop -- i.e. see predictions with no map context on top of the
+# road layout. (Setting map_png/map_json null instead removes the map from both.)
+map_for_model: true

@@ -138,9 +138,17 @@ class Trajectron(object):
                 z_mode=False,
                 gmm_mode=False,
                 full_dist=True,
-                all_z_sep=False):
+                all_z_sep=False,
+                output_dists=False):
+        """
+        :param output_dists: If True, also return a second dict of the analytic GMM
+            parameters (mus/covariances/pis) that the model itself computed for each
+            node, instead of only the Monte Carlo position samples. When True, this
+            method returns (predictions_dict, dists_dict); otherwise just predictions_dict.
+        """
 
         predictions_dict = {}
+        dists_dict = {}
         for node_type in self.env.NodeType:
             if node_type not in self.pred_state:
                 continue
@@ -170,21 +178,26 @@ class Trajectron(object):
                 map = map.to(self.device)
 
             # Run forward pass
-            predictions = model.predict(inputs=x,
-                                        inputs_st=x_st_t,
-                                        first_history_indices=first_history_index,
-                                        neighbors=neighbors_data_st,
-                                        neighbors_edge_value=neighbors_edge_value,
-                                        robot=robot_traj_st_t,
-                                        map=map,
-                                        prediction_horizon=ph,
-                                        num_samples=num_samples,
-                                        z_mode=z_mode,
-                                        gmm_mode=gmm_mode,
-                                        full_dist=full_dist,
-                                        all_z_sep=all_z_sep)
+            y_dist, predictions = model.predict(inputs=x,
+                                                inputs_st=x_st_t,
+                                                first_history_indices=first_history_index,
+                                                neighbors=neighbors_data_st,
+                                                neighbors_edge_value=neighbors_edge_value,
+                                                robot=robot_traj_st_t,
+                                                map=map,
+                                                prediction_horizon=ph,
+                                                num_samples=num_samples,
+                                                z_mode=z_mode,
+                                                gmm_mode=gmm_mode,
+                                                full_dist=full_dist,
+                                                all_z_sep=all_z_sep)
 
             predictions_np = predictions.cpu().detach().numpy()
+
+            if output_dists:
+                mus_np = y_dist.mus.cpu().detach().numpy()                        # [ns, bs, ph, K, 2]
+                covs_np = y_dist.get_covariance_matrix().cpu().detach().numpy()   # [ns, bs, ph, K, 2, 2]
+                pis_np = torch.exp(y_dist.log_pis).cpu().detach().numpy()         # [ns, bs, ph, K]
 
             # Assign predictions to node
             for i, ts in enumerate(timesteps_o):
@@ -192,4 +205,15 @@ class Trajectron(object):
                     predictions_dict[ts] = dict()
                 predictions_dict[ts][nodes[i]] = np.transpose(predictions_np[:, [i]], (1, 0, 2, 3))
 
+                if output_dists:
+                    if ts not in dists_dict.keys():
+                        dists_dict[ts] = dict()
+                    dists_dict[ts][nodes[i]] = {
+                        'mus': np.transpose(mus_np[:, [i]], (1, 0, 2, 3, 4)),
+                        'covs': np.transpose(covs_np[:, [i]], (1, 0, 2, 3, 4, 5)),
+                        'pis': np.transpose(pis_np[:, [i]], (1, 0, 2, 3)),
+                    }
+
+        if output_dists:
+            return predictions_dict, dists_dict
         return predictions_dict
