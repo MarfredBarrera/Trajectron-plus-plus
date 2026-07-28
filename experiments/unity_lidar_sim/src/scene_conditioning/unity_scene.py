@@ -1,22 +1,23 @@
 """
-Run a pre-trained Trajectron++ model on FutureDet / Unity-sim ground-truth agent
-tracks and visualize the predicted trajectory *distribution*.
+Scene ingest shared by the offline and online Unity-sim prediction drivers.
 
-Scene, model, and render settings live in a YAML config (default config.yaml,
-see that file); the command line only takes the knobs that actually change
-run-to-run.
+`unity_predict.py` (batch replay via Trajectron.predict) and `unity_online.py`
+(streaming replay via BatchedOnlineTrajectron.incremental_forward) need exactly the
+same setup before any model runs:
 
-Usage (from experiments/unity_lidar_sim/):
-    python unity_predict.py
-    python unity_predict.py --config configs/sweep_s1_rail.yaml --gpu 0
-    python unity_predict.py --style gaussian --format mp4
-See `python unity_predict.py -h`. To re-render a stored bundle without
-re-running the model, use visualize.py instead.
+    YAML config -> GT tracks + ego poses -> track filtering -> scene bounds
+                -> drivable-area GeometricMap -> Environment / Scene / Nodes
+
+That whole pipeline lives here, behind `prepare_scene(cfg)`, which returns a
+`UnityScene` holding the Environment, the Scene, the ego pose lookups, and the
+bundle metadata both drivers write to disk. Neither driver should reach past
+`UnityScene` into the raw JSON/CSV.
+
+The Node encoding (column layout, 2 Hz cadence, standardization) is copied from
+nuScenes `process_data.py` so it matches what the int_ee_me weights were trained on.
 """
 import os
-import sys
 import json
-import argparse
 
 import numpy as np
 import pandas as pd
@@ -25,12 +26,8 @@ import dill
 import torch
 from PIL import Image
 
-sys.path.append('../../trajectron')
-sys.path.append('../nuScenes')
+import repo_paths  # noqa: F401  (sys.path side effect: trajectron/)
 from environment import Environment, Scene, Node, GeometricMap, derivative_of
-from helper import load_model
-from utils import prediction_output_to_trajectories
-from traj_viz import save_bundle, load_bundle, render_bundle
 
 
 def resolve_device(gpu):
@@ -49,7 +46,7 @@ def resolve_device(gpu):
 
 
 # --------------------------------------------------------------------------- #
-# YAML config (everything except --gpu/--style/--format; see config.yaml)      #
+# YAML config (see configs/config.yaml for the annotated reference)            #
 # --------------------------------------------------------------------------- #
 DEFAULT_CONFIG = {
     'data_dir': 'unity_data/sweep_s1_hdl_frame_fixed',
@@ -77,6 +74,28 @@ DEFAULT_CONFIG = {
     # the proximity gate (e.g. when no poses.csv is available it is skipped anyway).
     'ego_radius': 150.0,
     'min_motion': 1.0,
+    # --- unity_online.py only (ignored by unity_predict.py) ------------------- #
+    # Timesteps streamed into the encoders before the first prediction, which lands at
+    # warmup_timesteps + 1. Longer warm-up = each agent's LSTM has more context at the
+    # first prediction; see online_engine.OnlineEngine._warm_up.
+    'warmup_timesteps': 1,
+    # Observations an agent needs before it is predicted for. 1 = from its second
+    # observation onwards, which is what unity_predict.py's min_history_timesteps gives.
+    'min_history_timesteps': 1,
+    # Reference path the crossing risk is measured against, per timestep:
+    #   'logged'    - the ego's actual future over the horizon (matches unity_predict.py
+    #                 + risk_eval.py; uses information not causally available at t)
+    #   'projected' - constant-velocity dead reckoning from the ego's current pose,
+    #                 i.e. what an online planner would actually have.
+    'ego_path_mode': 'logged',
+    # Feed the ego's planned future to the model (Trajectron++ `incl_robot_node`): the ego
+    # joins the scene as the robot node, so it both becomes a neighbour in the interaction
+    # graph and conditions every agent's prediction on where the ego is going. Requires a
+    # checkpoint trained with incl_robot_node: true; both drivers refuse to run if the
+    # config and the checkpoint disagree.
+    'ego_conditioning': False,
+    'risk_time_window': 1,     # temporal slack in horizon steps; -1 = ignore timing
+    'risk_file': None,         # null = <out_dir>/risk_crossings.csv
 }
 
 
@@ -121,7 +140,7 @@ standardization = {
 
 
 # --------------------------------------------------------------------------- #
-# 1. Read unity ground-truth tracks                                        #
+# 1. Read unity ground-truth tracks                                            #
 # --------------------------------------------------------------------------- #
 def load_gt_tracks(gt_json_path, stride):
     """Read gt_agents.json -> per-agent contiguous tracks resampled to 2 Hz.
@@ -241,8 +260,64 @@ def scene_bounds(tracks, margin=50.0):
     return x_min, y_min, x_max, y_max
 
 
+def make_node(env, tr, x_min, y_min, is_robot=False):
+    """One track dict -> a Trajectron++ Node in scene-local coords.
+
+    Column layout and derivative conventions are copied from nuScenes process_data.py, so
+    the node state matches what the pre-trained weights were trained on.
+    """
+    x = tr['x'] - x_min
+    y = tr['y'] - y_min
+    vx = derivative_of(x, dt)
+    vy = derivative_of(y, dt)
+    ax = derivative_of(vx, dt)
+    ay = derivative_of(vy, dt)
+
+    if tr['type'] == 'VEHICLE':
+        heading = tr['heading']
+        v = np.stack((vx, vy), axis=-1)
+        v_norm = np.linalg.norm(v, axis=-1, keepdims=True)
+        heading_v = np.divide(v, v_norm, out=np.zeros_like(v), where=(v_norm > 1.))
+        data_dict = {
+            ('position', 'x'): x, ('position', 'y'): y,
+            ('velocity', 'x'): vx, ('velocity', 'y'): vy,
+            ('velocity', 'norm'): np.linalg.norm(np.stack((vx, vy), axis=-1), axis=-1),
+            ('acceleration', 'x'): ax, ('acceleration', 'y'): ay,
+            ('acceleration', 'norm'): np.linalg.norm(np.stack((ax, ay), axis=-1), axis=-1),
+            ('heading', 'x'): heading_v[:, 0], ('heading', 'y'): heading_v[:, 1],
+            ('heading', '°'): heading, ('heading', 'd°'): derivative_of(heading, dt, radian=True),
+        }
+        node_data = pd.DataFrame(data_dict, columns=data_columns_vehicle)
+        node_type = env.NodeType.VEHICLE
+    else:
+        data_dict = {
+            ('position', 'x'): x, ('position', 'y'): y,
+            ('velocity', 'x'): vx, ('velocity', 'y'): vy,
+            ('acceleration', 'x'): ax, ('acceleration', 'y'): ay,
+        }
+        node_data = pd.DataFrame(data_dict, columns=data_columns_pedestrian)
+        node_type = env.NodeType.PEDESTRIAN
+
+    return Node(node_type=node_type, node_id=tr['id'], data=node_data,
+                first_timestep=tr['first_timestep'], is_robot=is_robot)
+
+
+def ego_track(timestep_t_ns, ego_t, ego_xy, ego_yaw, n_timesteps, node_id='EGO'):
+    """The ego's own pose history as a track dict, in the same shape as an agent track.
+
+    poses.csv is sampled on the raw (~10 Hz) clock, so each 2 Hz scene timestep takes the
+    nearest pose -- the same lookup used everywhere else the ego is read.
+    """
+    poses = [ego_pose_at(timestep_t_ns[t], ego_t, ego_xy, ego_yaw) for t in range(n_timesteps)]
+    xy = np.array([p[0] for p in poses], dtype=float)
+    yaw = np.array([p[1] for p in poses], dtype=float)
+    yaw = (yaw + np.pi) % (2.0 * np.pi) - np.pi
+    return {'id': node_id, 'type': 'VEHICLE', 'first_timestep': 0,
+            'x': xy[:, 0], 'y': xy[:, 1], 'heading': yaw}
+
+
 def build_environment(tracks, n_timesteps, x_min, y_min, x_max, y_max,
-                      scene_name='sweep_s1', map_gmap=None):
+                      scene_name='sweep_s1', map_gmap=None, robot_track=None):
     env = Environment(node_type_list=['VEHICLE', 'PEDESTRIAN'], standardization=standardization)
     attention_radius = {
         (env.NodeType.PEDESTRIAN, env.NodeType.PEDESTRIAN): 10.0,
@@ -258,41 +333,17 @@ def build_environment(tracks, n_timesteps, x_min, y_min, x_max, y_max,
     scene.map = {'PEDESTRIAN': gmap, 'VEHICLE': gmap, 'VISUALIZATION': gmap}
 
     for tr in tracks:
-        x = tr['x'] - x_min
-        y = tr['y'] - y_min
-        vx = derivative_of(x, dt)
-        vy = derivative_of(y, dt)
-        ax = derivative_of(vx, dt)
-        ay = derivative_of(vy, dt)
+        scene.nodes.append(make_node(env, tr, x_min, y_min))
 
-        if tr['type'] == 'VEHICLE':
-            heading = tr['heading']
-            v = np.stack((vx, vy), axis=-1)
-            v_norm = np.linalg.norm(v, axis=-1, keepdims=True)
-            heading_v = np.divide(v, v_norm, out=np.zeros_like(v), where=(v_norm > 1.))
-            data_dict = {
-                ('position', 'x'): x, ('position', 'y'): y,
-                ('velocity', 'x'): vx, ('velocity', 'y'): vy,
-                ('velocity', 'norm'): np.linalg.norm(np.stack((vx, vy), axis=-1), axis=-1),
-                ('acceleration', 'x'): ax, ('acceleration', 'y'): ay,
-                ('acceleration', 'norm'): np.linalg.norm(np.stack((ax, ay), axis=-1), axis=-1),
-                ('heading', 'x'): heading_v[:, 0], ('heading', 'y'): heading_v[:, 1],
-                ('heading', '°'): heading, ('heading', 'd°'): derivative_of(heading, dt, radian=True),
-            }
-            node_data = pd.DataFrame(data_dict, columns=data_columns_vehicle)
-            node_type = env.NodeType.VEHICLE
-        else:
-            data_dict = {
-                ('position', 'x'): x, ('position', 'y'): y,
-                ('velocity', 'x'): vx, ('velocity', 'y'): vy,
-                ('acceleration', 'x'): ax, ('acceleration', 'y'): ay,
-            }
-            node_data = pd.DataFrame(data_dict, columns=data_columns_pedestrian)
-            node_type = env.NodeType.PEDESTRIAN
-
-        node = Node(node_type=node_type, node_id=tr['id'], data=node_data,
-                    first_timestep=tr['first_timestep'])
-        scene.nodes.append(node)
+    # The ego joins the scene as the robot node when the model conditions on its plan. It is
+    # a full scene node, not just a side channel: it becomes a neighbour in the interaction
+    # graph like any other vehicle. Both drivers then leave it out of the *predicted* set --
+    # `get_timesteps_data` passes `return_robot=not incl_robot_node`, and
+    # `BatchedOnlineTrajectron` skips it the same way.
+    if robot_track is not None:
+        robot = make_node(env, robot_track, x_min, y_min, is_robot=True)
+        scene.nodes.append(robot)
+        scene.robot = robot
 
     env.scenes = [scene]
     return env, scene
@@ -363,93 +414,122 @@ def load_drivable_map(png_path, json_path, x_min, y_min, target_res_m_per_px=1.0
 
 
 # --------------------------------------------------------------------------- #
-# 3. Prediction engine (model -> serializable per-timestep arrays)             #
+# 3. The prepared scene handed to a prediction driver                          #
 # --------------------------------------------------------------------------- #
-def predict_frame(eval_stg, scene, t, ph, num_samples, min_history_timesteps=1,
-                  need_samples=True):
-    """Run the predict() calls at one timestep and extract a serializable record:
-    per node, history / GT future / most-likely path / analytic GMM params (all in
-    scene-local coords). Returns None if no node is predictable at t.
+class UnityScene(object):
+    """A Unity scene ingested and ready for inference.
 
-    `need_samples`: when False (gaussian-only viz) the expensive Monte Carlo sampling
-    pass is skipped and each node's `samples` is stored empty -- history/future are
-    sourced from the most-likely pass instead, which carries the same GT arrays."""
-    with torch.no_grad():
-        preds = None
-        if need_samples:
-            preds = eval_stg.predict(scene, np.array([t]), ph, num_samples=num_samples,
-                                     min_history_timesteps=min_history_timesteps,
-                                     z_mode=False, gmm_mode=False, full_dist=True)
-        preds_mm = eval_stg.predict(scene, np.array([t]), ph, num_samples=1,
-                                    min_history_timesteps=min_history_timesteps,
-                                    z_mode=True, gmm_mode=True)
-        # Deterministic per-latent-mode GMM (mean/cov propagated analytically through the
-        # dynamics model), for the Gaussian-blob viz -- no sample statistics involved.
-        _, dists_d = eval_stg.predict(scene, np.array([t]), ph, num_samples=1,
-                                      min_history_timesteps=min_history_timesteps,
-                                      z_mode=False, gmm_mode=True, full_dist=True,
-                                      output_dists=True)
-    if not preds_mm:
-        return None
-    # history/future are identical across passes; take them from the most-likely one so
-    # this works whether or not the sampling pass ran.
-    predmm_d, hist_d, fut_d = prediction_output_to_trajectories(preds_mm, scene.dt, 10, ph, map=None)
-    pred_d = None
-    if preds:
-        pred_d, _, _ = prediction_output_to_trajectories(preds, scene.dt, 10, ph, map=None)
-    tk = list(predmm_d.keys())[0]
-    dtk = list(dists_d.keys())[0]
-    nodes = []
-    for node in sorted(predmm_d[tk].keys(), key=lambda n: n.id):
-        dist = dists_d[dtk][node]
-        samples = (np.asarray(pred_d[tk][node][0], dtype=np.float32) if pred_d is not None
-                   else np.empty((0, ph, 2), dtype=np.float32))
-        nodes.append({
-            'id': node.id, 'type': node.type.name,
-            'history': np.asarray(hist_d[tk][node], dtype=np.float32),
-            'future': np.asarray(fut_d[tk][node], dtype=np.float32),
-            'samples': samples,                                             # (S, ph, 2)
-            'ml': np.asarray(predmm_d[tk][node][0, 0], dtype=np.float32),    # (ph, 2)
-            'dist_mus': np.asarray(dist['mus'][0, 0], dtype=np.float32),    # (ph, K, 2)
-            'dist_covs': np.asarray(dist['covs'][0, 0], dtype=np.float32), # (ph, K, 2, 2)
-            'dist_pis': np.asarray(dist['pis'][0, 0], dtype=np.float32),   # (ph, K)
-        })
-    return {'t': int(t), 'nodes': nodes}
+    Attributes:
+        env, scene      the Trajectron++ Environment / Scene (scene-local coords)
+        name            scene name, taken from the data_dir basename
+        n_timesteps     number of 2 Hz timesteps in the log
+        x_min, y_min    world -> scene-local origin shift applied to every node
+        out_dir         resolved output directory (created)
+        map_bounds      world bounds of the drivable raster, or None
+        robot           the ego as a scene Node, or None unless `ego_conditioning`
+    """
+
+    def __init__(self, cfg, name, out_dir, tracks, n_timesteps, timestep_t_ns,
+                 ego_t, ego_xy, ego_yaw, bounds, env, scene, map_bounds):
+        self.robot = scene.robot
+        self.cfg = cfg
+        self.name = name
+        self.out_dir = out_dir
+        self.tracks = tracks
+        self.n_timesteps = n_timesteps
+        self.timestep_t_ns = timestep_t_ns
+        self._ego_t, self._ego_xy, self._ego_yaw = ego_t, ego_xy, ego_yaw
+        self.x_min, self.y_min, self.x_max, self.y_max = bounds
+        self.env = env
+        self.scene = scene
+        self.map_bounds = map_bounds
+
+    @property
+    def has_ego(self):
+        return self._ego_t is not None
+
+    def ego_pose(self, t):
+        """(xy, yaw) of the ego at timestep `t` in world coords, or None without poses.csv."""
+        if not self.has_ego:
+            return None
+        return ego_pose_at(self.timestep_t_ns[t], self._ego_t, self._ego_xy, self._ego_yaw)
+
+    def ego_logged_path(self, t, ph):
+        """The ego's *actual* future path over the horizon (world coords): positions at
+        timesteps t+1..t+ph, truncated at the end of the log. Returns None if unavailable.
+
+        This is ground truth read out of the log, so it is not information an online
+        planner would have at time t -- see `ego_projected_path` for the causal version."""
+        if not self.has_ego:
+            return None
+        pts = [self.ego_pose(t + h)[0] for h in range(1, ph + 1) if t + h < self.n_timesteps]
+        return [np.asarray(p, dtype=float).tolist() for p in pts] if pts else None
+
+    def ego_projected_path(self, t, ph, dt_s=dt):
+        """Constant-velocity dead reckoning of the ego over the horizon (world coords),
+        using only poses at or before `t` -- the causally-available stand-in for
+        `ego_logged_path`. Velocity is the finite difference over the last timestep;
+        at t = 0 there is no velocity yet, so None is returned."""
+        if not self.has_ego or t < 1:
+            return None
+        p1 = np.asarray(self.ego_pose(t)[0], dtype=float)
+        p0 = np.asarray(self.ego_pose(t - 1)[0], dtype=float)
+        vel = (p1 - p0) / dt_s
+        return [(p1 + vel * (h * dt_s)).tolist() for h in range(1, ph + 1)]
+
+    def ego_plan_state(self, t, ph, state_spec):
+        """The ego's planned state over [t, t+ph] as the model's robot input, (ph+1, state).
+
+        Scene-local and unstandardized; row 0 is the ego's present state and rows 1..ph its
+        plan over the horizon. Returns None unless the scene was built with a robot node
+        (`ego_conditioning`).
+
+        With `ego_path_mode: logged` the plan *is* the ego's logged future -- fine when the
+        ego is the vehicle being planned for, since a planner knows its own intended path,
+        but it is not a causal input for a replayed third-party log.
+
+        Past the end of the log the last known state is held rather than zero-padded. The
+        offline preprocessing pads with zeros there, which teleports the ego to the scene
+        origin; holding keeps the plan plausible over the final `ph` timesteps.
+        """
+        if self.robot is None:
+            return None
+        last = min(t + ph, self.n_timesteps - 1)
+        traj = self.robot.get(np.array([t, last]), state_spec)
+        if len(traj) < ph + 1:
+            traj = np.vstack([traj, np.repeat(traj[-1:], ph + 1 - len(traj), axis=0)])
+        return traj
+
+    def ego_path(self, t, ph, mode='logged'):
+        """Reference path for the crossing-risk metric; `mode` in {'logged', 'projected'}."""
+        if mode == 'logged':
+            return self.ego_logged_path(t, ph)
+        if mode == 'projected':
+            return self.ego_projected_path(t, ph)
+        raise ValueError(f"unknown ego_path_mode {mode!r} (expected 'logged' or 'projected')")
+
+    def bundle_meta(self, **extra):
+        """The `meta` dict of an on-disk prediction bundle (see src/bundle.py for the format).
+        Drivers pass their own gif_prefix / extra fields through `extra`."""
+        all_x = np.concatenate([t['x'] for t in self.tracks])
+        all_y = np.concatenate([t['y'] for t in self.tracks])
+        meta = {'source': 'unity', 'scene': self.name, 'dt': dt, 'ph': self.cfg['ph'],
+                'num_samples': self.cfg['num_samples'], 'x_min': self.x_min, 'y_min': self.y_min,
+                'xlim': (all_x.min() - 15, all_x.max() + 15),
+                'ylim': (all_y.min() - 15, all_y.max() + 15),
+                'zoom': self.cfg['zoom'], 'gif_prefix': 'distribution'}
+        if self.map_bounds is not None:
+            meta['map_png'] = os.path.abspath(self.cfg['map_png'])
+            meta['map_bounds'] = self.map_bounds
+        meta.update(extra)
+        return meta
 
 
-def run_predictions(eval_stg, scene, timesteps, ph, num_samples,
-                    min_history_timesteps=1, ego_fn=None, need_samples=True, ego_path_fn=None):
-    """Predict over a list of timesteps -> list of frame records. `ego_fn(t)` (optional)
-    returns (pos, yaw) of the ego at t (stored so the visualizer can toggle ego view).
-    `ego_path_fn(t)` (optional) returns the ego's actual future path [[x,y], ...] over the
-    horizon in world coords (for the trajectory-crossing risk metric).
-    `need_samples` is threaded to predict_frame to gate the Monte Carlo sampling pass."""
-    frames = []
-    for i, t in enumerate(timesteps):
-        rec = predict_frame(eval_stg, scene, t, ph, num_samples, min_history_timesteps,
-                            need_samples=need_samples)
-        if rec is not None:
-            ego = None if ego_fn is None else ego_fn(t)
-            rec['ego'] = None if ego is None else [np.asarray(ego[0], dtype=float).tolist(),
-                                                   float(ego[1])]
-            rec['ego_path'] = None if ego_path_fn is None else ego_path_fn(t)
-            frames.append(rec)
-        print(f'  predict [{i + 1}/{len(timesteps)}] t={t}', end='\r', flush=True)
-    print()
-    return frames
+def prepare_scene(cfg):
+    """Ingest the scene `cfg` points at: tracks + ego poses -> filtered -> Environment.
 
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--config', default='configs/config.yaml',
-                   help='YAML config with scene/model/render settings (see configs/config.yaml)')
-    p.add_argument('--gpu', type=int, default=-1, help='CUDA device index to run on (e.g. --gpu 2); -1 = CPU')
-    p.add_argument('--style', default='samples', choices=['samples', 'gaussian', 'both'],
-                   help='distribution render style: sample fan, Gaussian blobs, or both')
-    p.add_argument('--format', default='gif', choices=['gif', 'mp4', 'both'], help='output video format(s)')
-    args = p.parse_args()
-    cfg = load_config(args.config)
-
+    Returns a `UnityScene`. Side effects: creates the output directory and, when
+    `cfg['save_env']`, dumps the Environment to <out_dir>/env.pkl."""
     # data_dir unifies gt_agents.json + poses.csv: both live beside each other for a
     # scene, so pointing at one directory can never pair mismatched files.
     gt_json = os.path.join(cfg['data_dir'], 'gt_agents.json')
@@ -457,7 +537,6 @@ def main():
     scene_name = os.path.basename(os.path.normpath(cfg['data_dir'])) or 'unity'
     out_dir = cfg['out_dir'] or os.path.join('unity_out', scene_name)
     os.makedirs(out_dir, exist_ok=True)
-    pred_file = cfg['pred_file'] or os.path.join(out_dir, 'predictions.pkl')
 
     print('Loading GT tracks...')
     tracks, n_timesteps, timestep_t_ns = load_gt_tracks(gt_json, cfg['stride'])
@@ -478,27 +557,15 @@ def main():
     else:
         print(f'  no ego poses found at {poses_csv} (ego view will be unavailable)')
 
-    def ego_for(t):
-        if ego_t is None:
-            return None
-        return ego_pose_at(timestep_t_ns[t], ego_t, ego_xy, ego_yaw)
-
-    def ego_path_for(t):
-        """Ego's actual future path over the prediction horizon (world coords), sampled at
-        the same cadence as the agent predictions -- positions at timesteps t+1..t+ph,
-        truncated near the end of the log. Used as the reference path for the crossing risk."""
-        if ego_t is None:
-            return None
-        pts = [ego_pose_at(timestep_t_ns[t + h], ego_t, ego_xy, ego_yaw)[0]
-               for h in range(1, cfg['ph'] + 1) if t + h < n_timesteps]
-        return [np.asarray(p, dtype=float).tolist() for p in pts] if pts else None
-
     n_before = len(tracks)
     tracks = filter_tracks(tracks, timestep_t_ns, ego_t, ego_xy, ego_yaw,
                            ego_radius=cfg['ego_radius'], min_motion=cfg['min_motion'])
     print(f'  {len(tracks)}/{n_before} tracks kept after filtering (near-ego + moving)')
+    if not tracks:
+        raise SystemExit('no tracks left after filtering -- loosen ego_radius / min_motion')
 
-    x_min, y_min, x_max, y_max = scene_bounds(tracks)
+    bounds = scene_bounds(tracks)
+    x_min, y_min, x_max, y_max = bounds
 
     map_gmap = map_bounds = None
     if cfg['map_png'] and cfg['map_json']:
@@ -517,45 +584,24 @@ def main():
     if map_gmap is not None and not cfg['map_for_model']:
         print('  map DISABLED for model inference (blank map); still drawn in visualization')
 
+    # Scene bounds deliberately cover the agent tracks only, ego included or not, so a
+    # conditioned and an unconditioned run of the same scene share a coordinate frame. The
+    # ego may sit slightly outside them; nothing crops on the bounds except the blank-map
+    # fallback, and the ego is never map-encoded (it is not predicted).
+    robot_track = None
+    if cfg['ego_conditioning']:
+        if ego_t is None:
+            raise SystemExit(f'ego_conditioning requires ego poses, but {poses_csv} is missing')
+        robot_track = ego_track(timestep_t_ns, ego_t, ego_xy, ego_yaw, n_timesteps)
+        print('  ego joins the scene as the robot node (conditioning on its planned future)')
+
     print('Building Environment...')
     env, scene = build_environment(tracks, n_timesteps, x_min, y_min, x_max, y_max,
-                                   scene_name=scene_name, map_gmap=model_map)
+                                   scene_name=scene_name, map_gmap=model_map,
+                                   robot_track=robot_track)
     if cfg['save_env']:
         with open(os.path.join(out_dir, 'env.pkl'), 'wb') as f:
             dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
 
-    # world-coord axis limits from actual agent positions (with a small pad)
-    all_x = np.concatenate([t['x'] for t in tracks])
-    all_y = np.concatenate([t['y'] for t in tracks])
-    xlim = (all_x.min() - 15, all_x.max() + 15)
-    ylim = (all_y.min() - 15, all_y.max() + 15)
-
-    device = resolve_device(args.gpu)
-    print(f'Loading model from {cfg["model_dir"]} (ts={cfg["model_ts"]}) on {device}...')
-    eval_stg, hyp = load_model(cfg['model_dir'], env, ts=cfg['model_ts'], device=device)
-
-    timesteps = [cfg['single_t']] if cfg['single_t'] is not None \
-        else list(range(2, n_timesteps - 1, cfg['frame_stride']))
-    # 'gaussian' renders only the analytic GMM, so skip the expensive sampling pass.
-    need_samples = args.style in ('samples', 'both')
-    frames = run_predictions(eval_stg, scene, timesteps, cfg['ph'], cfg['num_samples'],
-                             ego_fn=ego_for, need_samples=need_samples, ego_path_fn=ego_path_for)
-
-    meta = {'source': 'unity', 'scene': scene.name, 'dt': dt, 'ph': cfg['ph'],
-            'num_samples': cfg['num_samples'], 'x_min': x_min, 'y_min': y_min,
-            'xlim': xlim, 'ylim': ylim, 'zoom': cfg['zoom'], 'gif_prefix': 'distribution'}
-    if map_bounds is not None:
-        meta['map_png'] = os.path.abspath(cfg['map_png'])
-        meta['map_bounds'] = map_bounds
-    save_bundle(pred_file, meta, frames)
-    print(f'Saved {len(frames)} prediction frames -> {pred_file}')
-
-    # ------- optional rendering from the just-computed bundle -------
-    if not cfg['no_viz']:
-        render_bundle({'meta': meta, 'frames': frames}, out_dir, ego_frame=cfg['ego_frame'],
-                      fps=cfg['fps'], zoom=cfg['zoom'], single=cfg['single_t'] is not None,
-                      fmt=args.format, style=args.style, workers=cfg['workers'])
-
-
-if __name__ == '__main__':
-    main()
+    return UnityScene(cfg, scene_name, out_dir, tracks, n_timesteps, timestep_t_ns,
+                      ego_t, ego_xy, ego_yaw, bounds, env, scene, map_bounds)

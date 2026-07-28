@@ -7,15 +7,22 @@ matplotlib / PIL) -- no torch, no model, no GPU -- so you can re-render, switch 
 ego frame, change fps/zoom, etc. without ever touching the model.
 
 Usage (from experiments/unity_lidar_sim/):
-    python visualize.py --pred_file unity_out/sweep_s1_rail/predictions.pkl
-    python visualize.py --pred_file unity_out/sweep_s1_rail/predictions.pkl --ego_frame --zoom 60 --fps 2
+    python src/visualization/visualize.py --pred_file unity_out/sweep_s1_rail/predictions.pkl
+    python src/visualization/visualize.py --pred_file unity_out/sweep_s1_rail/predictions.pkl --ego_frame --zoom 60 --fps 2
 Or, for a nuScenes bundle (from experiments/nuScenes/):
-    python ../unity_lidar_sim/visualize.py --pred_file nuscenes_out/predictions.pkl --out_dir nuscenes_out
+    python ../unity_lidar_sim/src/visualization/visualize.py --pred_file nuscenes_out/predictions.pkl --out_dir nuscenes_out
 """
 import os
+import sys
+
+# Runnable directly, which puts *this file's* directory on sys.path rather than src/; add the
+# source root so the sibling packages resolve either way.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 
-from traj_viz import load_bundle, render_bundle
+from bundle import load_bundle
+from visualization.traj_viz import render_bundle
 
 
 def main():

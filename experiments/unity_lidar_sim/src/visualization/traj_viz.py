@@ -1,29 +1,11 @@
-"""
-Rendering + on-disk bundle IO for the Trajectron++ trajectory-distribution viz.
+"""Rendering for the Trajectron++ trajectory-distribution viz.
 
 This module has NO torch / model dependencies, so `visualize.py` can render stored
-predictions without a GPU or loading the model. The prediction scripts
-(`unity_predict.py`, `nuscenes_predict.py`) run the model, extract per-timestep
-trajectory arrays, and `save_bundle(...)` them; the visualizer `load_bundle(...)`s and
-renders.
-
-Bundle format (pickle):
-    {'meta':  {source, scene, dt, ph, num_samples, x_min, y_min, xlim, ylim,
-               zoom, gif_prefix},
-     'frames': [ {'t': int,
-                  'ego': [[ex, ey], yaw] or None,      # world coords; enables ego view
-                  'nodes': [ {'id', 'type',
-                              'history' (H,2), 'future' (F,2),
-                              'samples' (S,ph,2), 'ml' (ph,2),
-                              'dist_mus' (ph,K,2), 'dist_covs' (ph,K,2,2), 'dist_pis' (ph,K)},
-                             ... ]}, ... ]}
-
-All node arrays are in SCENE-LOCAL coords; meta['x_min'/'y_min'] shift them to world.
-Whether a frame is drawn in world or ego view is a *render-time* choice -- the ego pose
-is always stored, so the visualizer can toggle it without re-running the model.
+predictions without a GPU or loading the model: the prediction drivers run the model and
+`bundle.save_bundle(...)` the result, and the visualizer `bundle.load_bundle(...)`s it and
+renders. See src/bundle.py for the format of what is being drawn.
 """
 import os
-import pickle
 
 import numpy as np
 import matplotlib
@@ -36,22 +18,7 @@ from matplotlib.lines import Line2D
 from matplotlib.transforms import Affine2D
 from PIL import Image
 
-# distinct colors cycled per agent
-AGENT_COLORS = ['#375397', '#F05F78', '#80CBE5', '#ABCB51', '#C8B0B0', '#E8A33D',
-                '#7B68EE', '#2ECC71', '#E74C3C', '#1ABC9C', '#F39C12', '#9B59B6']
-
-
-# --------------------------------------------------------------------------- #
-# Bundle IO                                                                     #
-# --------------------------------------------------------------------------- #
-def save_bundle(path, meta, frames):
-    with open(path, 'wb') as f:
-        pickle.dump({'meta': meta, 'frames': frames}, f)
-
-
-def load_bundle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+from visualization.colors import color_for, precompute_order
 
 
 # --------------------------------------------------------------------------- #
@@ -72,12 +39,6 @@ def _identity_transform(p):
 
 
 _identity_transform.R = np.eye(2)
-
-
-def _color_for(node_id, order):
-    if node_id not in order:
-        order[node_id] = len(order)
-    return AGENT_COLORS[order[node_id] % len(AGENT_COLORS)]
 
 
 def _draw_sample_fan(ax, hist, s, c):
@@ -164,7 +125,7 @@ def draw_frame(ax, record, off, transform, order, style='samples'):
         return transform(raw.reshape(-1, 2) + off).reshape(raw.shape)
 
     for nd in record['nodes']:
-        c = _color_for(nd['id'], order)
+        c = color_for(nd['id'], order)
         hist = to_plot(nd['history'])
         fut = to_plot(nd['future'])
         s = to_plot(nd['samples'])          # (num_samples, ph, 2)
@@ -301,16 +262,6 @@ def _build_map_rgba(meta, target_long_px=1600):
     return map_rgba, meta.get('map_bounds')
 
 
-def _precompute_order(frames):
-    """Global node_id -> color index by first appearance (frame, then node order), so every
-    frame -- including ones rendered in parallel worker processes -- colors agents the same."""
-    order = {}
-    for rec in frames:
-        for nd in rec['nodes']:
-            _color_for(nd['id'], order)
-    return order
-
-
 # per-worker read-only state, set once by the pool initializer to avoid re-pickling the
 # map raster / meta / color map for every frame.
 _WORKER = {}
@@ -344,7 +295,7 @@ def render_bundle(bundle, out_dir, ego_frame=False, fps=2.0, zoom=None, single=F
     # global color map + drivable-map background, both built once and reused for every
     # frame (see unity_maps/handoff.md). Only non-drivable pixels get an alpha tint, so the
     # drivable ribbon itself stays clean.
-    order = _precompute_order(frames)
+    order = precompute_order(frames)
     map_rgba, map_bounds = _build_map_rgba(meta)
 
     if single:

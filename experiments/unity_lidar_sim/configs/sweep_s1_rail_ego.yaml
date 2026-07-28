@@ -1,0 +1,44 @@
+# Streaming run of sweep_s1_rail WITH ego-plan conditioning (Trajectron++ incl_robot_node).
+# Identical to sweep_s1_rail_online.yaml apart from the model and the ego keys, so the two
+# runs isolate what conditioning on the ego's plan actually changes.
+#
+# Requires a checkpoint trained with incl_robot_node: true. models/robot/model_registrar-12.pt
+# comes from the upstream repo's eccv2020 branch (master ships configs only). Note its
+# pred_state is VEHICLE-only, so pedestrians are not predicted at all by this model.
+data_dir: unity_data/sweep_s1_rail
+
+model_dir: ../nuScenes/models/robot
+model_ts: 12
+
+stride: 5
+ph: 10                      # models/robot was trained with prediction_horizon: 6
+num_samples: 5000
+
+frame_stride: 1
+single_t: null
+ego_frame: true
+zoom: 100.0
+fps: 2.0
+
+out_dir: unity_out/sweep_s1_rail_ego
+pred_file: null
+save_env: false
+no_viz: false
+
+map_png: unity_maps/Demo_drivable.png
+map_json: unity_maps/Demo_drivable.json
+map_for_model: true
+
+# --- online ---------------------------------------------------------------- #
+warmup_timesteps: 8
+min_history_timesteps: 1
+
+# The ego joins the scene as the robot node: it becomes a neighbour in the interaction graph
+# AND every agent's prediction is conditioned on its plan over the horizon.
+ego_conditioning: true
+
+# With ego_conditioning the ego's logged future is treated as its plan -- reasonable when the
+# ego is the vehicle you are planning for, since it knows its own intended path.
+ego_path_mode: logged
+risk_time_window: 1
+risk_file: null
