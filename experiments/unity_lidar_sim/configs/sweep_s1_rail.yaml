@@ -8,8 +8,6 @@ stride: 5
 ph: 10
 num_samples: 1000
 
-frame_stride: 1
-single_t: null
 ego_frame: true
 zoom: 100.0
 fps: 2.0

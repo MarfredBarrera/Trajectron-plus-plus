@@ -1,7 +1,7 @@
 """Stable per-agent colours.
 
 Split out of traj_viz so the risk metric can label agents consistently with the renderer
-without importing matplotlib: `risk_eval.crossing` runs inside the online loop, where a
+without importing matplotlib: `risk_eval.proximity` runs inside the online loop, where a
 plotting dependency has no business being.
 """
 

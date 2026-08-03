@@ -1,7 +1,7 @@
-"""The crossing-risk overlay video: ego path, crossing samples, per-agent risk labels.
+"""The proximity-risk overlay video: the ego's disc, entering samples, per-agent risk labels.
 
-Split from the metric (crossing.py) so scoring a frame inside the online loop does not pull
-in matplotlib. Consumes the `per_frame` map that `crossing.evaluate`/`evaluate_frame`
+Split from the metric (proximity.py) so scoring a frame inside the online loop does not pull
+in matplotlib. Consumes the `per_frame` map that `proximity.evaluate`/`evaluate_frame`
 produce, so a live run and a re-score of a stored bundle render identically.
 """
 import os
@@ -13,16 +13,21 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
+from matplotlib.patches import Circle
 
+from risk_eval.proximity import DEFAULT_RADIUS
 from visualization.traj_viz import (_build_map_rgba, _draw_map_background, _assemble,
                                     ego_transform, _identity_transform)
 
 
-def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom=None):
-    """One PNG per frame + a GIF and/or MP4 (`fmt` in {gif, mp4, both}): map, ego path
-    (bold red), crossing samples red, the rest faded in the agent colour, each agent
-    labelled with its crossing risk. `ego_frame` renders in the ego's frame (ego at the
-    origin, heading up), cropped to +/- `zoom` metres."""
+def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom=None,
+           radius=DEFAULT_RADIUS):
+    """One PNG per frame + a GIF and/or MP4 (`fmt` in {gif, mp4, both}): map, the ego's
+    keep-out disc (bold red), samples that reach into it in red, the rest faded in the agent
+    colour, each agent labelled with its proximity risk. Only what the metric actually reads
+    is drawn -- the ego's future path is stored in the bundle but deliberately not shown.
+    `ego_frame` renders in the ego's frame (ego at the origin, heading up), cropped to
+    +/- `zoom` metres."""
     meta = bundle['meta']
     map_rgba, map_bounds = _build_map_rgba(meta)
     if zoom is None:
@@ -34,7 +39,7 @@ def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom
         t = rec['t']
         if t not in per_frame:
             continue
-        ego_poly, fr = per_frame[t]
+        ego_xy, fr = per_frame[t]
         ego = rec.get('ego')
         use_ego = ego_frame and ego is not None
         if use_ego:
@@ -52,25 +57,27 @@ def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom
         _draw_map_background(ax, map_rgba, map_bounds,
                              ego=(ego_pos, ego_yaw) if use_ego else None,
                              crop_radius=zoom * 1.6 if use_ego else None)
-        # ego path
-        ep = T(ego_poly)
-        ax.plot(ep[:, 0], ep[:, 1], '-', color='#D62728', lw=2.6, zorder=700,
-                path_effects=[pe.Stroke(linewidth=4.5, foreground='w'), pe.Normal()])
-        ax.scatter([ep[0, 0]], [ep[0, 1]], marker='^', s=180, color='#D62728',
+        # The ego's keep-out disc. Both transforms are rigid, so a circle stays a circle and
+        # only its centre needs mapping.
+        c = T(ego_xy)
+        ax.add_patch(Circle(c, radius, fill=True, facecolor='#D62728', alpha=0.07, zorder=690))
+        ax.add_patch(Circle(c, radius, fill=False, edgecolor='#D62728', lw=2.4, zorder=700,
+                            path_effects=[pe.Stroke(linewidth=4.2, foreground='w'), pe.Normal()]))
+        ax.scatter([c[0]], [c[1]], marker='^', s=180, color='#D62728',
                    edgecolors='k', linewidths=1.0, zorder=760)
         for nd in rec['nodes']:
             if nd['id'] not in fr:
                 continue
-            mask, samples_w, c = fr[nd['id']]
+            mask, samples_w, col = fr[nd['id']]
             samples_p = T(samples_w)
             cur = samples_p[0, 0]
             if (~mask).any():
-                ax.add_collection(LineCollection(samples_p[~mask], colors=c, linewidths=0.5,
+                ax.add_collection(LineCollection(samples_p[~mask], colors=col, linewidths=0.5,
                                                  alpha=0.05, zorder=400))
             if mask.any():
                 ax.add_collection(LineCollection(samples_p[mask], colors='#D62728',
                                                  linewidths=0.6, alpha=0.14, zorder=450))
-            ax.scatter([cur[0]], [cur[1]], s=30, color=c, edgecolors='k', linewidths=0.6,
+            ax.scatter([cur[0]], [cur[1]], s=30, color=col, edgecolors='k', linewidths=0.6,
                        zorder=650)
             ax.annotate(f'{mask.mean():.2f}', (cur[0], cur[1]), textcoords='offset points',
                         xytext=(6, 6), fontsize=8, color='k', zorder=660,
@@ -78,16 +85,18 @@ def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom
         if use_ego:
             ax.set_xlim(-zoom, zoom); ax.set_ylim(-zoom, zoom)
             ax.set_xlabel('ego x (right) [m]'); ax.set_ylabel('ego y (forward) [m]')
-            title = f'Ego-crossing risk (ego frame)  |  t = {t}  ({t * meta.get("dt", 0.5):.1f}s)'
+            title = (f'Ego-proximity risk, R = {radius:g} m (ego frame)  |  '
+                     f't = {t}  ({t * meta.get("dt", 0.5):.1f}s)')
         else:
             ax.set_xlim(meta['xlim']); ax.set_ylim(meta['ylim'])
             ax.set_xlabel('map x [m]'); ax.set_ylabel('map y [m]')
-            title = f'Ego-crossing risk  |  t = {t}  ({t * meta.get("dt", 0.5):.1f}s)'
+            title = (f'Ego-proximity risk, R = {radius:g} m  |  '
+                     f't = {t}  ({t * meta.get("dt", 0.5):.1f}s)')
         ax.set_aspect('equal')
         ax.set_title(title, fontsize=14)
-        handles = [Line2D([], [], color='#D62728', lw=2.6, label='Ego projected path'),
-                   Line2D([], [], color='#D62728', lw=1.0, alpha=0.8, label='Crossing samples'),
-                   Line2D([], [], color='#888', lw=1.0, alpha=0.7, label='Non-crossing samples')]
+        handles = [Line2D([], [], color='#D62728', lw=2.4, label=f'Ego disc (R = {radius:g} m)'),
+                   Line2D([], [], color='#D62728', lw=1.0, alpha=0.8, label='Entering samples'),
+                   Line2D([], [], color='#888', lw=1.0, alpha=0.7, label='Non-entering samples')]
         leg = ax.legend(handles=handles, loc='upper right', fontsize=11, frameon=True, facecolor='white')
         leg.set_zorder(1000)
         out = os.path.join(frame_dir, f'risk_{t:04d}.png')

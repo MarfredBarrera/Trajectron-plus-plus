@@ -1,16 +1,15 @@
 """
-Scene ingest shared by the offline and online Unity-sim prediction drivers.
+Scene ingest for the Unity-sim prediction driver.
 
-`unity_predict.py` (batch replay via Trajectron.predict) and `unity_online.py`
-(streaming replay via BatchedOnlineTrajectron.incremental_forward) need exactly the
-same setup before any model runs:
+`unity_online.py` (streaming replay via BatchedOnlineTrajectron.incremental_forward)
+needs this whole setup before any model runs:
 
     YAML config -> GT tracks + ego poses -> track filtering -> scene bounds
                 -> drivable-area GeometricMap -> Environment / Scene / Nodes
 
 That whole pipeline lives here, behind `prepare_scene(cfg)`, which returns a
 `UnityScene` holding the Environment, the Scene, the ego pose lookups, and the
-bundle metadata both drivers write to disk. Neither driver should reach past
+bundle metadata the driver writes to disk. The driver should not reach past
 `UnityScene` into the raw JSON/CSV.
 
 The Node encoding (column layout, 2 Hz cadence, standardization) is copied from
@@ -55,8 +54,6 @@ DEFAULT_CONFIG = {
     'stride': 5,
     'ph': 6,
     'num_samples': 200,
-    'frame_stride': 1,
-    'single_t': None,
     'ego_frame': False,
     'zoom': 80.0,
     'fps': 2.0,
@@ -74,28 +71,29 @@ DEFAULT_CONFIG = {
     # the proximity gate (e.g. when no poses.csv is available it is skipped anyway).
     'ego_radius': 150.0,
     'min_motion': 1.0,
-    # --- unity_online.py only (ignored by unity_predict.py) ------------------- #
+    # --- online run + risk scoring -------------------------------------------- #
     # Timesteps streamed into the encoders before the first prediction, which lands at
     # warmup_timesteps + 1. Longer warm-up = each agent's LSTM has more context at the
     # first prediction; see online_engine.OnlineEngine._warm_up.
     'warmup_timesteps': 1,
     # Observations an agent needs before it is predicted for. 1 = from its second
-    # observation onwards, which is what unity_predict.py's min_history_timesteps gives.
+    # observation onwards, the conventional rule.
     'min_history_timesteps': 1,
-    # Reference path the crossing risk is measured against, per timestep:
-    #   'logged'    - the ego's actual future over the horizon (matches unity_predict.py
-    #                 + risk_eval.py; uses information not causally available at t)
+    # The ego path stored in the bundle for context and drawn by the visualizers. Not an
+    # input to the risk metric, which only uses the ego's pose at t:
+    #   'logged'    - the ego's actual future over the horizon (uses information not
+    #                 causally available at t)
     #   'projected' - constant-velocity dead reckoning from the ego's current pose,
     #                 i.e. what an online planner would actually have.
     'ego_path_mode': 'logged',
     # Feed the ego's planned future to the model (Trajectron++ `incl_robot_node`): the ego
     # joins the scene as the robot node, so it both becomes a neighbour in the interaction
     # graph and conditions every agent's prediction on where the ego is going. Requires a
-    # checkpoint trained with incl_robot_node: true; both drivers refuse to run if the
+    # checkpoint trained with incl_robot_node: true; the driver refuses to run if the
     # config and the checkpoint disagree.
     'ego_conditioning': False,
-    'risk_time_window': 1,     # temporal slack in horizon steps; -1 = ignore timing
-    'risk_file': None,         # null = <out_dir>/risk_crossings.csv
+    'risk_radius': 25.0,       # metres; radius of the ego's keep-out disc (see risk_eval)
+    'risk_file': None,         # null = <out_dir>/risk_online.csv
 }
 
 
@@ -501,7 +499,8 @@ class UnityScene(object):
         return traj
 
     def ego_path(self, t, ph, mode='logged'):
-        """Reference path for the crossing-risk metric; `mode` in {'logged', 'projected'}."""
+        """The ego path stored in the bundle for context/viz; `mode` in
+        {'logged', 'projected'}. The risk metric does not read it -- see risk_eval.proximity."""
         if mode == 'logged':
             return self.ego_logged_path(t, ph)
         if mode == 'projected':

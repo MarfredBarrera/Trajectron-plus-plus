@@ -2,7 +2,7 @@
 Render a stored Trajectron++ prediction bundle to frames + a GIF.
 
 This is the *visualization-only* entry point: it loads a bundle written by
-unity_predict.py / nuscenes_predict.py and renders it. It imports only traj_viz (numpy /
+unity_online.py / nuscenes_predict.py and renders it. It imports only traj_viz (numpy /
 matplotlib / PIL) -- no torch, no model, no GPU -- so you can re-render, switch to the
 ego frame, change fps/zoom, etc. without ever touching the model.
 

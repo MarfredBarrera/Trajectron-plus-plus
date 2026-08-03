@@ -1,14 +1,14 @@
 """Streaming Trajectron++ inference for the Unity-sim pipeline.
 
 `OnlineEngine` drives `BatchedOnlineTrajectron` over a scene one timestep at a time and
-emits frame records in the same on-disk bundle format `unity_predict.py` produces (see
-src/bundle.py), so visualization and risk_eval apply unchanged.
+emits frame records in the on-disk bundle format (see src/bundle.py), so visualization and
+risk_eval apply unchanged.
 
-Batch replay (unity_predict.py) hands `Trajectron.predict()` a finished log and lets it
-re-read each agent's whole history window at every timestep. This engine instead hands the
-model one observation per agent per timestep and keeps the recurrent state between them,
-which is how a perception -> prediction stack actually runs and what makes per-timestep risk
-scoring meaningful rather than a post-hoc sweep over a completed log.
+The offline alternative would hand `Trajectron.predict()` a finished log and let it re-read
+each agent's whole history window at every timestep. This engine instead hands the model one
+observation per agent per timestep and keeps the recurrent state between them, which is how a
+perception -> prediction stack actually runs and what makes per-timestep risk scoring
+meaningful rather than a post-hoc sweep over a completed log.
 
 Streaming semantics
 -------------------
@@ -43,7 +43,7 @@ MIN_WARMUP_TIMESTEPS = 1
 # encoder pass. Flip any of these to False to skip that pass; the fields it would have filled
 # are written as empty arrays so records keep the bundle format and the rest of the pipeline
 # still loads them (it just has nothing to draw or score for the skipped pass).
-#   DECODE_SAMPLES     -- Monte Carlo samples; the crossing-risk metric is defined on these.
+#   DECODE_SAMPLES     -- Monte Carlo samples; the proximity-risk metric is defined on these.
 #   DECODE_MOST_LIKELY -- single z_mode/gmm_mode trajectory ('ml').
 #   DECODE_DISTS       -- analytic per-mode GMM ('dist_mus'/'dist_covs'/'dist_pis').
 DECODE_SAMPLES = True
@@ -96,10 +96,10 @@ class OnlineEngine(object):
     :param warmup_timesteps: observations streamed into the encoders before the first
         prediction; the first predicted timestep is `warmup_timesteps + 1`.
     :param min_history_timesteps: observations an agent needs before it is predicted for
-        (1 = from its second observation, matching unity_predict.py).
+        (1 = from its second observation).
     :param need_samples: when False the Monte Carlo pass is skipped and each record's
         `samples` is stored empty -- only useful for Gaussian-only rendering, since the
-        crossing-risk metric is defined on samples.
+        proximity-risk metric is defined on samples.
     """
 
     def __init__(self, unity_scene, model_dir, model_ts, device, ph, num_samples,
@@ -192,7 +192,7 @@ class OnlineEngine(object):
         self._observe(t)
 
         # Up to three decoder passes off one encoder pass, each mirroring the corresponding
-        # predict() call in unity_predict.predict_frame flag for flag -- minus their
+        # offline predict() call flag for flag -- minus their
         # redundant re-encoding. Each is gated by its DECODE_* toggle above.
         samples = most_likely = dists = None
         if self.need_samples:

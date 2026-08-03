@@ -1,6 +1,4 @@
-# Scene / model / render configuration for unity_predict.py (batch) and
-# unity_online.py (streaming). Both drivers read the same schema; the last
-# section only applies to unity_online.py and is ignored by unity_predict.py.
+# Scene / model / render / risk configuration for unity_online.py.
 # Command-line flags stay limited to what actually changes run-to-run
 # (--gpu, --style, --format); everything else lives here. To run a
 # different scene, either edit data_dir below or copy this file and pass
@@ -17,8 +15,6 @@ stride: 5              # resample source frames (10Hz) -> 2Hz
 ph: 6                   # prediction horizon, steps @2Hz (6 = 3s)
 num_samples: 200        # Monte Carlo samples per predicted node
 
-frame_stride: 1         # render every k-th timestep in the video
-single_t: null          # render just one timestep (debug); null = full video
 ego_frame: false        # render zoomed-in, ego at origin heading up
 zoom: 80.0               # ego-frame half-window in metres
 fps: 5.0                  # output video frame rate
@@ -42,7 +38,7 @@ map_json: unity_maps/Demo_drivable.json
 map_for_model: true
 
 # --------------------------------------------------------------------------- #
-# unity_online.py only (ignored by unity_predict.py)                           #
+# online run + risk scoring                                                    #
 # --------------------------------------------------------------------------- #
 
 # Observations streamed into the encoders before the first prediction; the first predicted
@@ -57,8 +53,7 @@ warmup_timesteps: 1
 # How many observations an agent needs before the model is allowed to predict for it. Its
 # encoders start advancing from its very first observation either way -- this only gates
 # when its output is emitted. 1 means "from its second observation onwards", which is the
-# same rule unity_predict.py applies via min_history_timesteps, so the two drivers predict
-# for the same agents at the same timesteps. 0 predicts from a single observation, where
+# the conventional rule. 0 predicts from a single observation, where
 # velocity/acceleration are still one-sided finite differences.
 min_history_timesteps: 1
 
@@ -72,18 +67,20 @@ min_history_timesteps: 1
 # vehicle being planned for -- a planner knows its own intended path.
 ego_conditioning: false
 
-# Reference path the crossing risk is measured against at each timestep:
-#   logged     the ego's actual future over the horizon. Matches what unity_predict.py
-#              stores and what risk_eval.py scores, so online and batch runs are directly
-#              comparable -- but it uses information not causally available at time t.
+# The ego path stored in the bundle and drawn by the visualizers, for context. The risk
+# metric does NOT read it -- it only uses the ego's pose at t -- so this choice does not
+# affect any risk number:
+#   logged     the ego's actual future over the horizon; uses information not
+#              causally available at time t.
 #   projected  constant-velocity dead reckoning from the ego's current pose, i.e. the
-#              reference path an online planner would actually have. Use this for a fully
-#              causal run; risk values are NOT comparable to a `logged` run.
+#              path an online planner would actually have.
 ego_path_mode: logged
 
-# Temporal slack (in horizon steps) for a crossing to count: the agent and the ego must
-# reach the crossing point within this many steps of each other. 0 = strictly simultaneous;
-# -1 = ignore timing (pure geometric crossing). Same meaning as risk_eval.py --time_window.
-risk_time_window: 1
+# Radius in metres of the ego's keep-out disc, the ego-proximity risk metric: an agent's
+# risk at timestep t is the fraction of its sampled trajectories that come within this
+# distance of where the ego is at t, at any point over the prediction horizon. The disc is
+# fixed for the timestep (it does not move along the horizon) and follows the ego from one
+# timestep to the next. Same meaning as risk_eval/cli.py --radius.
+risk_radius: 25.0
 
 risk_file: null            # null = <out_dir>/risk_online.csv

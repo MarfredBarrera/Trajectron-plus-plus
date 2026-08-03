@@ -14,8 +14,6 @@ stride: 5
 ph: 10                      # models/robot was trained with prediction_horizon: 6
 num_samples: 1000
 
-frame_stride: 1
-single_t: null
 ego_frame: true
 zoom: 100.0
 fps: 2.0
@@ -40,5 +38,5 @@ ego_conditioning: true
 # With ego_conditioning the ego's logged future is treated as its plan -- reasonable when the
 # ego is the vehicle you are planning for, since it knows its own intended path.
 ego_path_mode: logged
-risk_time_window: 1
+risk_radius: 25.0          # ego keep-out disc, metres
 risk_file: null
