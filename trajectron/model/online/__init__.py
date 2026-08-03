@@ -1,2 +1,4 @@
 from .online_trajectron import OnlineTrajectron
 from .online_mgcvae import OnlineMultimodalGenerativeCVAE
+from .batched_online_trajectron import BatchedOnlineTrajectron
+from .batched_online_mgcvae import BatchedOnlineMultimodalGenerativeCVAE

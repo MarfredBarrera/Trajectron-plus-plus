@@ -10,6 +10,19 @@ class Unicycle(Dynamic):
         self.F_s = torch.eye(4, device=self.device, dtype=torch.float32)
         self.F_s[0:2, 2:] = torch.eye(2, device=self.device, dtype=torch.float32) * self.dt
         self.F_s_t = self.F_s.transpose(-2, -1)
+        # `dyn_limits` is hyperparams['dynamic'][<node type>]['limits'], i.e. the model's
+        # config.json. Upstream stores it on the base class and then never reads it, so the
+        # declared bounds were dead config: the decoder samples dphi and a from unbounded
+        # Gaussians and the rollout integrates v <- v + a*dt with nothing limiting either, so
+        # one draw from the tail of that Gaussian puts a sample on a permanent runaway.
+        # Measured on sweep_s1_rail, ~0.1% of samples exceeded 40 m/s and the worst reached
+        # 390 m/s, while the median speed stayed correct and flat across the horizon.
+        # Enforcing the limits confines the rollout to the controls the model was trained
+        # with. A bound the config omits stays unbounded.
+        self.min_a = self.dyn_limits.get('min_a')
+        self.max_a = self.dyn_limits.get('max_a')
+        self.min_dphi = self.dyn_limits.get('min_heading_change')
+        self.max_dphi = self.dyn_limits.get('max_heading_change')
 
     def create_graph(self, xz_size):
         model_if_absent = nn.Linear(xz_size + 1, 1)
@@ -28,6 +41,16 @@ class Unicycle(Dynamic):
         v = x[3]
         dphi = u[0]
         a = u[1]
+
+        # Confine the sampled controls to the model's declared limits (see init_constants).
+        # Applied before the small-|dphi| branch below so that branch tests the clamped turn
+        # rate; clamping only shrinks |dphi|, so it can never push a sample across the 1e-2
+        # threshold from above. torch.clamp rejects a call with both bounds None, which is
+        # what a config carrying an empty `limits` gives us, so skip it in that case.
+        if self.min_dphi is not None or self.max_dphi is not None:
+            dphi = torch.clamp(dphi, self.min_dphi, self.max_dphi)
+        if self.min_a is not None or self.max_a is not None:
+            a = torch.clamp(a, self.min_a, self.max_a)
 
         mask = torch.abs(dphi) <= 1e-2
         dphi = ~mask * dphi + (mask) * 1
