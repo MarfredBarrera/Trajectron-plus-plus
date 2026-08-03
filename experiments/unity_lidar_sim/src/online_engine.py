@@ -39,16 +39,22 @@ from environment import Environment, Scene
 # graph one step of motion before anything is scored.
 MIN_WARMUP_TIMESTEPS = 1
 
-# Debugging/experimentation toggles: which decoder passes `step()` runs off its single
-# encoder pass. Flip any of these to False to skip that pass; the fields it would have filled
-# are written as empty arrays so records keep the bundle format and the rest of the pipeline
-# still loads them (it just has nothing to draw or score for the skipped pass).
+# Debugging/experimentation kill-switches: which decoder passes `step()` may run off its
+# single encoder pass. Flip any of these to False to force-skip that pass regardless of what
+# the caller asked for; the fields it would have filled are written as empty arrays so records
+# keep the bundle format and the rest of the pipeline still loads them (it just has nothing to
+# draw or score for the skipped pass).
+#
+# These are the *ceiling*, not the decision: which passes actually run is chosen per run by
+# the `need_samples` / `need_dists` constructor arguments, which unity_online.py derives from
+# --style. Leave them True unless you are deliberately bisecting a decoder pass -- a False
+# here silently empties that field in the bundle no matter how the run was invoked.
 #   DECODE_SAMPLES     -- Monte Carlo samples; the proximity-risk metric is defined on these.
 #   DECODE_MOST_LIKELY -- single z_mode/gmm_mode trajectory ('ml').
 #   DECODE_DISTS       -- analytic per-mode GMM ('dist_mus'/'dist_covs'/'dist_pis').
 DECODE_SAMPLES = True
-DECODE_MOST_LIKELY = False
-DECODE_DISTS = False
+DECODE_MOST_LIKELY = True
+DECODE_DISTS = True
 
 
 def load_online_hyperparams(model_dir, config_name='config.json'):
@@ -100,11 +106,14 @@ class OnlineEngine(object):
     :param need_samples: when False the Monte Carlo pass is skipped and each record's
         `samples` is stored empty -- only useful for Gaussian-only rendering, since the
         proximity-risk metric is defined on samples.
+    :param need_dists: when False the analytic per-mode GMM pass is skipped and each record's
+        `dist_mus`/`dist_covs`/`dist_pis` are stored empty -- fine for sample-fan rendering,
+        but a bundle written this way cannot be re-rendered with --style gaussian later.
     """
 
     def __init__(self, unity_scene, model_dir, model_ts, device, ph, num_samples,
                  warmup_timesteps=MIN_WARMUP_TIMESTEPS, min_history_timesteps=1,
-                 need_samples=True):
+                 need_samples=True, need_dists=True):
         if warmup_timesteps < MIN_WARMUP_TIMESTEPS:
             raise SystemExit(f'warmup_timesteps must be >= {MIN_WARMUP_TIMESTEPS} '
                              f'(see MIN_WARMUP_TIMESTEPS)')
@@ -116,6 +125,7 @@ class OnlineEngine(object):
         self.ph = ph
         self.num_samples = num_samples
         self.need_samples = need_samples and DECODE_SAMPLES
+        self.need_dists = need_dists and DECODE_DISTS
         self.init_timestep = warmup_timesteps
 
         self.hyperparams = load_online_hyperparams(model_dir)
@@ -193,7 +203,8 @@ class OnlineEngine(object):
 
         # Up to three decoder passes off one encoder pass, each mirroring the corresponding
         # offline predict() call flag for flag -- minus their
-        # redundant re-encoding. Each is gated by its DECODE_* toggle above.
+        # redundant re-encoding. Each runs only if this run needs its output (see the
+        # need_* arguments) and its DECODE_* kill-switch is on.
         samples = most_likely = dists = None
         if self.need_samples:
             samples = self.model.sample_model(self.ph, self.num_samples,
@@ -201,7 +212,7 @@ class OnlineEngine(object):
         if DECODE_MOST_LIKELY:
             most_likely = self.model.sample_model(self.ph, 1, z_mode=True, gmm_mode=True,
                                                   full_dist=True)
-        if DECODE_DISTS:
+        if self.need_dists:
             # Deterministic per-latent-mode GMM (mean/covariance propagated analytically
             # through the dynamics model), for the Gaussian-blob viz -- no sample statistics.
             _, dists = self.model.sample_model(self.ph, 1, z_mode=False, gmm_mode=True,

@@ -113,7 +113,9 @@ def main():
                    help='YAML config with scene/model/render/risk settings (see configs/config.yaml)')
     p.add_argument('--gpu', type=int, default=-1, help='CUDA device index to run on (e.g. --gpu 2); -1 = CPU')
     p.add_argument('--style', default='samples', choices=['samples', 'gaussian', 'both'],
-                   help='distribution render style: sample fan, Gaussian blobs, or both')
+                   help='distribution render style: sample fan, Gaussian blobs, or both. Also '
+                        'selects which decoder passes run, so it determines what this run '
+                        'stores in the bundle, not only how it is drawn')
     p.add_argument('--format', default='gif', choices=['gif', 'mp4', 'both'], help='output video format(s)')
     p.add_argument('--risk_viz', action='store_true',
                    help='also render the proximity-risk overlay video (ego disc + entering samples)')
@@ -139,14 +141,21 @@ def main():
 
     device = resolve_device(args.gpu)
     print(f'Loading model from {cfg["model_dir"]} (ts={cfg["model_ts"]}) on {device}...')
-    # 'gaussian' renders only the analytic GMM, but the proximity risk is defined on samples,
-    # so the sampling pass is only skippable when risk is off the table anyway.
+    # --style picks which decoder passes are worth running: it decides what ends up in the
+    # bundle, not just how the bundle is drawn. A pass that is skipped here leaves its fields
+    # empty on disk, so re-rendering this run later in the other style has nothing to draw.
+    # The one asymmetry is risk: it is defined on samples, so the sampling pass is only
+    # skippable when there is no ego to score against anyway.
     need_samples = args.style in ('samples', 'both') or scene.has_ego
+    need_dists = args.style in ('gaussian', 'both')
     engine = OnlineEngine(scene, cfg['model_dir'], cfg['model_ts'], device,
                           ph=cfg['ph'], num_samples=cfg['num_samples'],
                           warmup_timesteps=cfg['warmup_timesteps'],
                           min_history_timesteps=cfg['min_history_timesteps'],
-                          need_samples=need_samples)
+                          need_samples=need_samples, need_dists=need_dists)
+    print(f"  decoder passes for --style {args.style}: "
+          f"samples={'on' if engine.need_samples else 'off'}, "
+          f"analytic GMM={'on' if engine.need_dists else 'off'}")
 
     print(f'Streaming t={engine.first_timestep}..{scene.n_timesteps - 1} '
           f'(ph={cfg["ph"]}, {cfg["num_samples"]} samples/agent, '

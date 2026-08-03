@@ -60,6 +60,8 @@ def _draw_gaussian_blobs(ax, hist, dist_mus, dist_covs, dist_pis, transform, c,
     is raw scene-local covariance (ph, K, 2, 2) -- rotated (not translated) into plot
     coords using `transform.R`; `dist_pis` (ph, K) are the mixture weights (components
     below `pi_threshold` are skipped as visual clutter, not part of the actual math)."""
+    if np.size(dist_pis) == 0:   # bundle produced without the analytic-GMM decoder pass
+        return
     R = transform.R
     ph, K = dist_pis.shape
     mean_path = [hist[-1]]
@@ -237,6 +239,24 @@ def _assemble(paths, out_dir, prefix, ego_frame, fps, fmt):
     return outputs
 
 
+def _warn_if_style_has_no_data(frames, style):
+    """A bundle only holds what the decoder passes that produced it actually stored, so a
+    style whose fields were never filled renders as an empty frame with a legend entry and
+    nothing behind it. Say so once, up front, instead of drawing nothing in silence. The
+    producing run picks its passes from its own --style (see src/unity_online.py)."""
+    def has(key):
+        return any(np.size(nd[key]) for rec in frames for nd in rec['nodes'])
+
+    if style in ('samples', 'both') and not has('samples'):
+        print('  WARNING: style asks for the sample fan, but this bundle stores no samples '
+              '-- it was produced by a run whose sampling pass was off. Nothing will be drawn '
+              'for it; re-run the model with --style samples (or both).')
+    if style in ('gaussian', 'both') and not has('dist_pis'):
+        print('  WARNING: style asks for Gaussian blobs, but this bundle stores no GMM '
+              'parameters -- it was produced by a run whose analytic-GMM pass was off. '
+              'Nothing will be drawn for it; re-run the model with --style gaussian (or both).')
+
+
 def _build_map_rgba(meta, target_long_px=1600):
     """Build the non-drivable shading overlay once, downsampled so imshow is cheap.
 
@@ -297,6 +317,7 @@ def render_bundle(bundle, out_dir, ego_frame=False, fps=2.0, zoom=None, single=F
     # drivable ribbon itself stays clean.
     order = precompute_order(frames)
     map_rgba, map_bounds = _build_map_rgba(meta)
+    _warn_if_style_has_no_data(frames, style)
 
     if single:
         rec = frames[0]
