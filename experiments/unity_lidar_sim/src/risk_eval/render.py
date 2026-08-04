@@ -79,7 +79,10 @@ def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom
                                                  linewidths=0.6, alpha=0.14, zorder=450))
             ax.scatter([cur[0]], [cur[1]], s=30, color=col, edgecolors='k', linewidths=0.6,
                        zorder=650)
-            ax.annotate(f'{mask.mean():.2f}', (cur[0], cur[1]), textcoords='offset points',
+            # Three decimals: the risk is a fraction of `num_samples` entering the disc, so at
+            # the usual 1000 samples the thousandths place is exactly the metric's resolution.
+            # Two decimals quantized most agents in a low-risk scene to a flat 0.00.
+            ax.annotate(f'{mask.mean():.3f}', (cur[0], cur[1]), textcoords='offset points',
                         xytext=(6, 6), fontsize=8, color='k', zorder=660,
                         path_effects=[pe.Stroke(linewidth=2, foreground='w'), pe.Normal()])
         if use_ego:

@@ -53,7 +53,7 @@ def _draw_sample_fan(ax, hist, s, c):
 
 
 def _draw_gaussian_blobs(ax, hist, dist_mus, dist_covs, dist_pis, transform, c,
-                         n_stds=(1.0, 2.0), pi_threshold=0.05):
+                         n_stds=(1.0, 2.0), pi_threshold=0.01):
     """Per-horizon-step Gaussian blobs drawn straight from the decoder/GMM's own analytic
     parameters (mean + covariance propagated through the dynamics model), not estimated
     from sample statistics. `dist_mus` is already in plot coords: (ph, K, 2); `dist_covs`

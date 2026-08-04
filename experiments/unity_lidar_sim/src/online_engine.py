@@ -39,16 +39,20 @@ from environment import Environment, Scene
 # graph one step of motion before anything is scored.
 MIN_WARMUP_TIMESTEPS = 1
 
-# Debugging/experimentation toggles: which decoder passes `step()` runs off its single
-# encoder pass. Flip any of these to False to skip that pass; the fields it would have filled
-# are written as empty arrays so records keep the bundle format and the rest of the pipeline
-# still loads them (it just has nothing to draw or score for the skipped pass).
-#   DECODE_SAMPLES     -- Monte Carlo samples; the proximity-risk metric is defined on these.
-#   DECODE_MOST_LIKELY -- single z_mode/gmm_mode trajectory ('ml').
-#   DECODE_DISTS       -- analytic per-mode GMM ('dist_mus'/'dist_covs'/'dist_pis').
-DECODE_SAMPLES = True
-DECODE_MOST_LIKELY = False
-DECODE_DISTS = False
+# Which decoder passes `step()` runs off its single encoder pass, keyed by the render style
+# the run was launched with (`unity_online.py --style`). A pass that is off leaves the fields
+# it would have filled as empty arrays, so records keep the bundle format and the rest of the
+# pipeline still loads them -- it just has nothing to draw or score for the skipped pass.
+#   samples     -- Monte Carlo samples; the proximity-risk metric is defined on these.
+#   most_likely -- single z_mode/gmm_mode trajectory ('ml').
+#   dists       -- analytic per-mode GMM ('dist_mus'/'dist_covs'/'dist_pis').
+# Only the two distribution passes are style-dependent: traj_viz.draw_frame draws the
+# most-likely path in every style, so decoding it is never skipped.
+DECODE_PASSES = {
+    'samples':  {'samples': True,  'most_likely': True, 'dists': False},
+    'gaussian': {'samples': False, 'most_likely': True, 'dists': True},
+    'both':     {'samples': True,  'most_likely': True, 'dists': True},
+}
 
 
 def load_online_hyperparams(model_dir, config_name='config.json'):
@@ -97,17 +101,23 @@ class OnlineEngine(object):
         prediction; the first predicted timestep is `warmup_timesteps + 1`.
     :param min_history_timesteps: observations an agent needs before it is predicted for
         (1 = from its second observation).
-    :param need_samples: when False the Monte Carlo pass is skipped and each record's
-        `samples` is stored empty -- only useful for Gaussian-only rendering, since the
-        proximity-risk metric is defined on samples.
+    :param style: render style this run is feeding ('samples', 'gaussian' or 'both'); picks
+        which decoder passes `step()` runs, via DECODE_PASSES. A pass that is off stores its
+        field empty, so a bundle only carries what the chosen style will actually draw.
+    :param force_samples: keep the Monte Carlo pass on even in a style that would not draw
+        it. The proximity-risk metric is defined on samples, so a run that still has to score
+        risk needs them regardless of style.
     """
 
     def __init__(self, unity_scene, model_dir, model_ts, device, ph, num_samples,
                  warmup_timesteps=MIN_WARMUP_TIMESTEPS, min_history_timesteps=1,
-                 need_samples=True):
+                 style='samples', force_samples=False):
         if warmup_timesteps < MIN_WARMUP_TIMESTEPS:
             raise SystemExit(f'warmup_timesteps must be >= {MIN_WARMUP_TIMESTEPS} '
                              f'(see MIN_WARMUP_TIMESTEPS)')
+        if style not in DECODE_PASSES:
+            raise SystemExit(f'unknown style {style!r} -- expected one of '
+                             f'{", ".join(sorted(DECODE_PASSES))}')
 
         self.scene_data = unity_scene
         self.log_scene = unity_scene.scene
@@ -115,7 +125,11 @@ class OnlineEngine(object):
         self.device = device
         self.ph = ph
         self.num_samples = num_samples
-        self.need_samples = need_samples and DECODE_SAMPLES
+        self.style = style
+        passes = DECODE_PASSES[style]
+        self.need_samples = passes['samples'] or force_samples
+        self.need_most_likely = passes['most_likely']
+        self.need_dists = passes['dists']
         self.init_timestep = warmup_timesteps
 
         self.hyperparams = load_online_hyperparams(model_dir)
@@ -193,15 +207,15 @@ class OnlineEngine(object):
 
         # Up to three decoder passes off one encoder pass, each mirroring the corresponding
         # offline predict() call flag for flag -- minus their
-        # redundant re-encoding. Each is gated by its DECODE_* toggle above.
+        # redundant re-encoding. Each is gated by the render style (see DECODE_PASSES).
         samples = most_likely = dists = None
         if self.need_samples:
             samples = self.model.sample_model(self.ph, self.num_samples,
                                               z_mode=False, gmm_mode=False, full_dist=False)
-        if DECODE_MOST_LIKELY:
+        if self.need_most_likely:
             most_likely = self.model.sample_model(self.ph, 1, z_mode=True, gmm_mode=True,
                                                   full_dist=True)
-        if DECODE_DISTS:
+        if self.need_dists:
             # Deterministic per-latent-mode GMM (mean/covariance propagated analytically
             # through the dynamics model), for the Gaussian-blob viz -- no sample statistics.
             _, dists = self.model.sample_model(self.ph, 1, z_mode=False, gmm_mode=True,

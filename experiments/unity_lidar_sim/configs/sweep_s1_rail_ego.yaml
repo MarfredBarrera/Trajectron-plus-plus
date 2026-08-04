@@ -7,7 +7,7 @@
 # pred_state is VEHICLE-only, so pedestrians are not predicted at all by this model.
 data_dir: unity_data/sweep_s1_rail
 
-model_dir: ../nuScenes/models/robot
+model_dir: ../nuScenes/models/int_ee_me
 model_ts: 12
 
 stride: 5
@@ -33,7 +33,7 @@ min_history_timesteps: 1
 
 # The ego joins the scene as the robot node: it becomes a neighbour in the interaction graph
 # AND every agent's prediction is conditioned on its plan over the horizon.
-ego_conditioning: true
+ego_conditioning: false
 
 # With ego_conditioning the ego's logged future is treated as its plan -- reasonable when the
 # ego is the vehicle you are planning for, since it knows its own intended path.

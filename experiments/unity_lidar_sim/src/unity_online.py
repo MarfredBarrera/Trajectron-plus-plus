@@ -139,14 +139,14 @@ def main():
 
     device = resolve_device(args.gpu)
     print(f'Loading model from {cfg["model_dir"]} (ts={cfg["model_ts"]}) on {device}...')
-    # 'gaussian' renders only the analytic GMM, but the proximity risk is defined on samples,
-    # so the sampling pass is only skippable when risk is off the table anyway.
-    need_samples = args.style in ('samples', 'both') or scene.has_ego
+    # The style picks which decoder passes run (see online_engine.DECODE_PASSES). 'gaussian'
+    # renders only the analytic GMM, but the proximity risk is defined on samples, so the
+    # sampling pass is only skippable when risk is off the table anyway.
     engine = OnlineEngine(scene, cfg['model_dir'], cfg['model_ts'], device,
                           ph=cfg['ph'], num_samples=cfg['num_samples'],
                           warmup_timesteps=cfg['warmup_timesteps'],
                           min_history_timesteps=cfg['min_history_timesteps'],
-                          need_samples=need_samples)
+                          style=args.style, force_samples=scene.has_ego)
 
     print(f'Streaming t={engine.first_timestep}..{scene.n_timesteps - 1} '
           f'(ph={cfg["ph"]}, {cfg["num_samples"]} samples/agent, '

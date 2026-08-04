@@ -25,7 +25,8 @@ before online scoring simply lacks them, and the risk CLI falls back to rescorin
 All node arrays are in SCENE-LOCAL coords; meta['x_min'/'y_min'] shift them to world.
 Whether a frame is drawn in world or ego view is a *render-time* choice -- the ego pose is
 always stored, so the visualizer can toggle it without re-running the model. A decoder pass
-that was switched off (see online_engine's DECODE_* toggles) leaves its arrays zero-length.
+the run's `--style` did not call for (see online_engine.DECODE_PASSES) leaves its arrays
+zero-length.
 
 This module deliberately depends on nothing but pickle: writing a bundle at the end of a run
 should not pull in matplotlib, and neither should reading one.
