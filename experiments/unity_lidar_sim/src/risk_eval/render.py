@@ -16,19 +16,26 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 
 from risk_eval.proximity import DEFAULT_RADIUS
+from visualization.colors import palette_for
 from visualization.traj_viz import (_build_map_rgba, _draw_map_background, _assemble,
                                     ego_transform, _identity_transform)
 
 
 def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom=None,
-           radius=DEFAULT_RADIUS):
+           radius=DEFAULT_RADIUS, agent_colors=None):
     """One PNG per frame + a GIF and/or MP4 (`fmt` in {gif, mp4, both}): map, the ego's
     keep-out disc (bold red), samples that reach into it in red, the rest faded in the agent
     colour, each agent labelled with its proximity risk. Only what the metric actually reads
     is drawn -- the ego's future path is stored in the bundle but deliberately not shown.
     `ego_frame` renders in the ego's frame (ego at the origin, heading up), cropped to
-    +/- `zoom` metres."""
+    +/- `zoom` metres.
+
+    `agent_colors` is the {agent id: colour} identity map (visualization.colors); it defaults
+    to the renderer's own scheme. Pass the same map the risk time series is drawn with and the
+    video and the figure name agents alike."""
     meta = bundle['meta']
+    if agent_colors is None:
+        agent_colors = palette_for(bundle['frames'])
     map_rgba, map_bounds = _build_map_rgba(meta)
     if zoom is None:
         zoom = meta.get('zoom', 60.0)
@@ -68,7 +75,8 @@ def render(bundle, per_frame, out_dir, fps=2.0, fmt='gif', ego_frame=False, zoom
         for nd in rec['nodes']:
             if nd['id'] not in fr:
                 continue
-            mask, samples_w, col = fr[nd['id']]
+            mask, samples_w = fr[nd['id']]
+            col = agent_colors[nd['id']]
             samples_p = T(samples_w)
             cur = samples_p[0, 0]
             if (~mask).any():

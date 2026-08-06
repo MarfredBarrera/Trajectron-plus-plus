@@ -13,7 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 from matplotlib.collections import LineCollection
-from matplotlib.patches import Ellipse, Patch
+from matplotlib.patches import Ellipse
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Affine2D
 from PIL import Image
@@ -52,33 +52,73 @@ def _draw_sample_fan(ax, hist, s, c):
                                      alpha=0.06, zorder=400))
 
 
+def mode_cmap(hex_color):
+    """Sequential colormap within one agent's hue: pale tint (weak mode) -> deep (strong).
+
+    Per agent rather than one global scale, because agents are told apart by hue and because
+    the weights are not comparable across agents: a vehicle committed to one manoeuvre puts
+    pi ~ 0.6 on a single mode while a diffuse one spreads 25 modes over pi ~ 0.04 each, and a
+    shared scale would render the second as a uniform block of the palest colour.
+    """
+    base = np.array(matplotlib.colors.to_rgb(hex_color))
+    # the pale end stops at a 0.7 tint rather than at white: the weakest modes drawn are the
+    # ones at the pi threshold, and they still have to be visible to be dismissed.
+    return matplotlib.colors.LinearSegmentedColormap.from_list(
+        'mode_weight', [base + (1.0 - base) * 0.70, base + (1.0 - base) * 0.32,
+                        base, base * 0.55])
+
+
+def ellipse(mu, cov, n_std, **kw):
+    """Matplotlib Ellipse for the `n_std` contour of a 2-D Gaussian."""
+    vals, vecs = np.linalg.eigh(np.asarray(cov, float))
+    vals = np.clip(vals, 1e-9, None)
+    angle = np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1]))    # largest-eigenvalue axis
+    return Ellipse(mu, 2 * n_std * np.sqrt(vals[1]), 2 * n_std * np.sqrt(vals[0]),
+                   angle=angle, **kw)
+
+
 def _draw_gaussian_blobs(ax, hist, dist_mus, dist_covs, dist_pis, transform, c,
-                         n_stds=(1.0, 2.0), pi_threshold=0.01):
-    """Per-horizon-step Gaussian blobs drawn straight from the decoder/GMM's own analytic
+                         n_stds=(1.0,), pi_threshold=0.01):
+    """Per-horizon-step Gaussian contours drawn straight from the decoder/GMM's own analytic
     parameters (mean + covariance propagated through the dynamics model), not estimated
     from sample statistics. `dist_mus` is already in plot coords: (ph, K, 2); `dist_covs`
     is raw scene-local covariance (ph, K, 2, 2) -- rotated (not translated) into plot
     coords using `transform.R`; `dist_pis` (ph, K) are the mixture weights (components
-    below `pi_threshold` are skipped as visual clutter, not part of the actual math)."""
+    below `pi_threshold` are skipped as visual clutter, not part of the actual math).
+
+    Weight is COLOUR on the agent's own heat map (`mode_cmap`), not opacity -- the same
+    scheme as investigations/gaussian_propagation, and for the same reason: translucent
+    fills composite, so the darkness at a point was the number of ellipses stacked there
+    rather than any one mode's weight, and two modes crossing produced a third, darker
+    shape belonging to neither. Hollow contours do not composite. Modes are drawn
+    weakest-first so the ones carrying the belief end up on top, and stroke weight grows
+    along the horizon so the far end of the fan reads as the far end.
+    """
+    dist_pis = np.asarray(dist_pis, dtype=float)
+    if dist_pis.size == 0:      # bundle produced with --style samples: no GMM was stored
+        return
     R = transform.R
     ph, K = dist_pis.shape
-    mean_path = [hist[-1]]
-    for t in range(ph):
-        # pi-weighted mean over *all* components, independent of the drawing threshold
-        mean_path.append(np.sum(dist_pis[t][:, None] * dist_mus[t], axis=0))
-        for k in range(K):
-            if dist_pis[t, k] < pi_threshold:
-                continue
-            cov = R @ dist_covs[t, k] @ R.T
-            vals, vecs = np.linalg.eigh(cov)
-            vals = np.clip(vals, 1e-9, None)
-            angle = np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1]))   # largest-eigenvalue axis
+    cmap = mode_cmap(c)
+    # pi is a function of the encoder alone, so it is the same at every horizon step (see
+    # investigations/gmm_stats): one weight per mode fixes both the colour and the ordering,
+    # and a mode keeps its colour from the first step of the horizon to the last.
+    pis = dist_pis.max(axis=0)
+    vmax = max(float(pis.max()), 1e-9)
+    for rank, k in enumerate(np.argsort(pis)):
+        if pis[k] < pi_threshold:
+            continue
+        col = cmap(pis[k] / vmax)
+        # ranked within a narrow band so the contours stay under the sample fan (400)
+        z = 380 + 15.0 * rank / max(K - 1, 1)
+        for t in range(ph):
+            lw = 0.5 + 0.7 * (t / max(ph - 1, 1))
             for ns in n_stds:
-                ax.add_patch(Ellipse(dist_mus[t, k], 2 * ns * np.sqrt(vals[1]), 2 * ns * np.sqrt(vals[0]),
-                                     angle=angle, facecolor=c, edgecolor='none',
-                                     alpha=0.10, zorder=380))
-    mp = np.vstack(mean_path)
-    ax.plot(mp[:, 0], mp[:, 1], '-', color=c, lw=0.9, alpha=0.6, zorder=545)
+                ax.add_patch(ellipse(dist_mus[t, k], R @ dist_covs[t, k] @ R.T, ns,
+                                     facecolor='none', edgecolor=col, lw=lw, zorder=z))
+    # pi-weighted mean over *all* components, independent of the drawing threshold
+    mean_path = np.vstack([hist[-1], np.sum(dist_pis[..., None] * dist_mus, axis=1)])
+    ax.plot(mean_path[:, 0], mean_path[:, 1], '-', color=c, lw=0.9, alpha=0.6, zorder=545)
 
 
 def _draw_map_background(ax, map_rgba, bounds, ego=None, crop_radius=None):
@@ -175,7 +215,8 @@ def render_frame_to_file(record, meta, out_path, order, ego_frame=False, zoom=No
     if style in ('samples', 'both'):
         handles.append(Line2D([], [], color='#888', lw=1.0, alpha=0.7, label='Predicted samples'))
     if style in ('gaussian', 'both'):
-        handles.append(Patch(facecolor='#888', edgecolor='none', alpha=0.5, label='Predicted mean ±1,2σ'))
+        handles.append(Ellipse((0, 0), 1, 1, facecolor='none', edgecolor='#888', lw=1.2,
+                               label='Modes, 1σ  ·  colour = weight'))
     if use_ego:
         handles.append(Line2D([], [], marker='^', color='#FF0000', ls='', ms=12, mec='k', label='Ego'))
 

@@ -44,6 +44,7 @@ from risk_eval.render import render as render_risk
 from risk_eval.timeseries import plot_entry_counts, write_counts_csv
 from bundle import save_bundle, load_bundle
 from visualization.traj_viz import render_bundle
+from visualization.colors import palette_for
 
 
 # Columns of the per-timestep run log: one row per predicted timestep.
@@ -73,7 +74,6 @@ def run(scene, engine, cfg, radius, ego_path_mode):
     per-(timestep, agent) risk rows, and the run log.
     """
     frames, rows, log_rows = [], [], []
-    order = {}                       # agent id -> colour index, grown as agents appear
     off = np.array([scene.x_min, scene.y_min])
 
     for t in range(engine.first_timestep, scene.n_timesteps):
@@ -88,7 +88,7 @@ def run(scene, engine, cfg, radius, ego_path_mode):
                                                float(ego[1])]
         rec['ego_path'] = scene.ego_path(t, cfg['ph'], mode=ego_path_mode)
 
-        frame_rows, entry = evaluate_frame(rec, off, order, radius=radius)
+        frame_rows, entry = evaluate_frame(rec, off, radius=radius)
         if entry is not None:
             rows.extend(frame_rows)
             record_frame(rec, frame_rows, entry)      # risk goes into the bundle
@@ -160,7 +160,10 @@ def main():
                              warmup_timesteps=cfg['warmup_timesteps'],
                              min_history_timesteps=cfg['min_history_timesteps'],
                              ego_path_mode=ego_path_mode,
-                             risk_radius=cfg['risk_radius'])
+                             risk_radius=cfg['risk_radius'],
+                             # the dynamics config the controls in `ctrl_*` were emitted
+                             # under, limits included, so consumers need not load the model
+                             dynamic=engine.hyperparams['dynamic'])
     save_bundle(pred_file, meta, frames)
     print(f'Saved {len(frames)} prediction frames -> {pred_file}')
     write_csv(rows, risk_file)
@@ -184,11 +187,14 @@ def main():
     if args.risk_viz:
         disk_rows, per_frame = load_recorded(bundle)
         if per_frame:
+            # One identity map for the video and the time series, so an agent is the same
+            # colour in both.
+            agent_colors = palette_for(bundle['frames'])
             render_risk(bundle, per_frame, out_dir, fps=cfg['fps'], fmt=args.format,
                         ego_frame=cfg['ego_frame'], zoom=cfg['zoom'],
-                        radius=cfg['risk_radius'])
+                        radius=cfg['risk_radius'], agent_colors=agent_colors)
             plot_entry_counts(disk_rows, os.path.join(out_dir, 'risk_timeseries.png'),
-                              cfg['risk_radius'], dt=dt)
+                              cfg['risk_radius'], dt=dt, agent_colors=agent_colors)
             write_counts_csv(disk_rows, os.path.join(out_dir, 'risk_timeseries.csv'))
 
 

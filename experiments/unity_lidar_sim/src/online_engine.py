@@ -248,6 +248,8 @@ class OnlineEngine(object):
             'dist_mus': empty.reshape(0, 0, 2),                              # (ph, K, 2)
             'dist_covs': empty.reshape(0, 0, 2, 2),                          # (ph, K, 2, 2)
             'dist_pis': empty.reshape(0, 0),                                 # (ph, K)
+            'ctrl_mus': empty.reshape(0, 0, 2),                              # (ph, K, 2)
+            'ctrl_covs': empty.reshape(0, 0, 2, 2),                          # (ph, K, 2, 2)
         }
         if samples is not None:
             rec['samples'] = np.asarray(samples[node][0], dtype=np.float32)
@@ -258,6 +260,10 @@ class OnlineEngine(object):
             rec['dist_mus'] = np.asarray(dist['mus'][0, 0], dtype=np.float32)
             rec['dist_covs'] = np.asarray(dist['covs'][0, 0], dtype=np.float32)
             rec['dist_pis'] = np.asarray(dist['pis'][0, 0], dtype=np.float32)
+            # the same mixture before the dynamics integrated it: what the decoder itself
+            # emits, in control space. Weights are shared with dist_pis (see sample_model).
+            rec['ctrl_mus'] = np.asarray(dist['ctrl_mus'][0, 0], dtype=np.float32)
+            rec['ctrl_covs'] = np.asarray(dist['ctrl_covs'][0, 0], dtype=np.float32)
         return rec
 
     def _logged_future_of(self, node, t):

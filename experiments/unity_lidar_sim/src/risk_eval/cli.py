@@ -7,6 +7,8 @@ what the run actually decided at the time.
 
     python src/risk_eval/cli.py --pred_file unity_out/<scene>/predictions_online.pkl
     python src/risk_eval/cli.py --pred_file unity_out/<scene>/predictions_online.pkl --viz
+    python src/risk_eval/cli.py --pred_file unity_out/intersection_probe/predictions_online.pkl \
+        --junction_colors            # time-series agents in the investigation's own hues
 
 `--rescore` is the deliberate exception: it recomputes risk from the stored samples at a
 different radius, for sweeping the threshold without paying for inference again. It is
@@ -23,11 +25,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 
+import numpy as np
+
 from bundle import load_bundle
 from risk_eval.proximity import (DEFAULT_RADIUS, evaluate, has_recorded_risk, load_recorded,
                                  summarize, write_csv)
 from risk_eval.render import render
 from risk_eval.timeseries import plot_entry_counts, write_counts_csv
+from visualization.colors import DEFAULT_CENTER, junction_palette, palette_for
+
+
+def agent_palette(bundle, args):
+    """The identity map every figure this run draws is coloured under.
+
+    Two studies draw the same vehicles, and a figure is only readable next to the other if the
+    agent that is amber in one is amber in the other -- so which scheme applies is the
+    caller's choice, made once here.
+    """
+    if not args.junction_colors:
+        return palette_for(bundle['frames'])
+    meta = bundle['meta']
+    off = np.array([meta.get('x_min', 0.0), meta.get('y_min', 0.0)])
+    center = [float(v) for v in args.junction_center.split(',')]
+    return junction_palette(bundle['frames'], off, center)
 
 
 def main():
@@ -51,6 +71,12 @@ def main():
     p.add_argument('--radius', type=float, default=None,
                    help='ego disc radius in metres; implies --rescore when it differs from '
                         'the radius the run was scored with')
+    p.add_argument('--junction_colors', action='store_true',
+                   help='colour agents -- in both the time series and the overlay video -- '
+                        'the way the intersection investigations do (hue by roster position '
+                        'at the junction) instead of by order of appearance')
+    p.add_argument('--junction_center', default=','.join(str(c) for c in DEFAULT_CENTER),
+                   help='junction centre "x,y" in map coords, for --junction_colors')
     args = p.parse_args()
 
     bundle = load_bundle(args.pred_file)
@@ -74,15 +100,19 @@ def main():
         rows, per_frame = evaluate(bundle, radius=radius)
 
     summarize(rows, radius=radius)
+    # One identity map for everything this run draws: the video and the time series always
+    # name an agent with the same colour, whichever scheme is in force.
+    agent_colors = agent_palette(bundle, args)
     if rows:
         write_csv(rows, os.path.join(out_dir, 'risk_proximity.csv'))
         if not args.no_timeplot:
             plot_entry_counts(rows, os.path.join(out_dir, 'risk_timeseries.png'), radius,
-                              dt=bundle['meta'].get('dt', 0.5))
+                              dt=bundle['meta'].get('dt', 0.5), agent_colors=agent_colors)
             write_counts_csv(rows, os.path.join(out_dir, 'risk_timeseries.csv'))
     if args.viz:
         render(bundle, per_frame, out_dir, fps=args.fps, fmt=args.format,
-               ego_frame=args.ego_frame, zoom=args.zoom, radius=radius)
+               ego_frame=args.ego_frame, zoom=args.zoom, radius=radius,
+               agent_colors=agent_colors)
 
 
 if __name__ == '__main__':

@@ -26,8 +26,6 @@ import csv
 
 import numpy as np
 
-from visualization.colors import color_for, precompute_order
-
 
 DEFAULT_RADIUS = 25.0        # metres; the ego's keep-out disc
 
@@ -78,7 +76,7 @@ def entry_mask(samples_w, ego_xy, radius=DEFAULT_RADIUS):
 CSV_FIELDS = ['t', 'agent', 'type', 'n_samples', 'n_enter', 'risk', 'dist_now', 'min_dist']
 
 
-def evaluate_frame(rec, off, order, radius=DEFAULT_RADIUS):
+def evaluate_frame(rec, off, radius=DEFAULT_RADIUS):
     """Proximity risk for the agents of a single frame record.
 
     Split out of `evaluate` so a streaming driver (unity_online.py) can score a timestep the
@@ -86,11 +84,11 @@ def evaluate_frame(rec, off, order, radius=DEFAULT_RADIUS):
 
     :param rec: one bundle frame record ({'t', 'nodes', 'ego', ...}).
     :param off: (2,) scene-local -> world offset, i.e. meta['x_min'/'y_min'].
-    :param order: node_id -> colour index map, mutated in place as agents are first seen
-        (so colours stay stable across frames without knowing the agent set up front).
     :param radius: disc radius in metres.
     :return: (rows, frame_entry) where frame_entry is (ego_xy, {node_id: (mask,
-        samples_world, colour)}) for the visualizer, or None if the frame has no ego pose.
+        samples_world)}) for the visualizer, or None if the frame has no ego pose. Colour is
+        not decided here: it is an identity scheme the *figure* picks (visualization.colors),
+        and the metric has no business carrying one through the online loop.
     """
     if not rec.get('ego'):
         return [], None
@@ -109,7 +107,7 @@ def evaluate_frame(rec, off, order, radius=DEFAULT_RADIUS):
                      'risk': float(mask.mean()),
                      'dist_now': round(float(np.linalg.norm(cur + off - ego_xy)), 3),
                      'min_dist': round(float(dists.min()), 3)})
-        fr[nd['id']] = (mask, samples_w, color_for(nd['id'], order))
+        fr[nd['id']] = (mask, samples_w)
     return rows, (ego_xy, fr)
 
 
@@ -153,7 +151,6 @@ def load_recorded(bundle):
     """
     meta = bundle['meta']
     off = np.array([meta.get('x_min', 0.0), meta.get('y_min', 0.0)])
-    order = precompute_order(bundle['frames'])
     rows, per_frame = [], {}
     for rec in bundle['frames']:
         if not rec.get('ego'):
@@ -175,7 +172,7 @@ def load_recorded(bundle):
                          'risk': float(mask.mean()),
                          'dist_now': nd.get('risk_dist_now'),
                          'min_dist': nd.get('risk_min_dist')})
-            fr[nd['id']] = (mask, samples_w, color_for(nd['id'], order))
+            fr[nd['id']] = (mask, samples_w)
         if fr:
             per_frame[rec['t']] = (ego_xy, fr)
     return rows, per_frame
@@ -184,13 +181,12 @@ def load_recorded(bundle):
 def evaluate(bundle, radius=DEFAULT_RADIUS):
     """Compute proximity risk for every (frame, agent) with samples + an ego pose.
     Returns (rows, per_frame) where rows is a list of dicts and per_frame maps t ->
-    (ego_xy, {node_id: (entry_mask, samples_world, agent_color_idx)}) for the visualizer."""
+    (ego_xy, {node_id: (entry_mask, samples_world)}) for the visualizer."""
     meta = bundle['meta']
     off = np.array([meta.get('x_min', 0.0), meta.get('y_min', 0.0)])
-    order = precompute_order(bundle['frames'])
     rows, per_frame = [], {}
     for rec in bundle['frames']:
-        frame_rows, entry = evaluate_frame(rec, off, order, radius=radius)
+        frame_rows, entry = evaluate_frame(rec, off, radius=radius)
         if entry is None:
             continue
         rows.extend(frame_rows)

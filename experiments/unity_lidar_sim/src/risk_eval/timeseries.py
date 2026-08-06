@@ -1,18 +1,25 @@
-"""Total entering trajectories over time: the scene-level view of proximity risk.
+"""Entering trajectories over time, split by agent: the scene-level view of proximity risk.
 
 The per-agent CSV answers "which agent is risky at t"; this answers "how much of the
-predicted distribution is heading into the ego's disc at all, right now". For each
-timestep it sums `n_enter` over every predicted agent, so the series counts sampled
-trajectories, not agents:
+predicted distribution is heading into the ego's disc at all, right now", and which agents
+that total is made of. For each timestep it sums `n_enter` over every predicted agent, so the
+series counts sampled trajectories, not agents:
 
     entering(t) = sum over agents of (# samples reaching the ego's disc at t)
 
-The constant denominator (agents x samples-per-agent) is drawn as a reference line, so the
-height of the curve can be read as a fraction of the whole predicted distribution without a
-second axis.
+The figure stacks the per-agent counts, so the bands are the individual contributions and
+their top edge -- drawn as a line -- is exactly that cumulative total. One chart answers both
+questions, and the stack cannot disagree with the total the way two panels could.
+
+The constant denominator (agents x samples-per-agent) sets the y ceiling, so the height of
+the curve can be read as a fraction of the whole predicted distribution without a second
+axis.
 
 Kept apart from render.py because that module is the per-frame overlay video; this is one
-static summary figure over the whole run.
+static summary figure over the whole run. Agent colours are not this module's to invent: the
+caller passes the identity map (`visualization.colors`), so a band is the same colour as that
+agent's samples in the video -- or, with `--junction_colors`, the same colour as that agent
+in the intersection investigation's figures.
 """
 import os
 
@@ -22,13 +29,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator, MaxNLocator, MultipleLocator
 
+from visualization.colors import color_for
 
-# Chart tokens. One series, so one categorical hue; text never wears the series colour.
-# Verified against the #fcfcfb surface: series 4.30:1 (needs 3:1 as a graphical mark),
-# muted ink 7.73:1 (needs 4.5:1 as text). Light surface only -- these figures are written to
-# disk and read alongside the other pipeline PNGs, all of which commit to a white background.
+
+# Chart tokens. Series hues come from the agent palette (visualization.colors) so identity is
+# shared with the overlay video; text never wears a series colour. Verified against the
+# #fcfcfb surface: muted ink 7.73:1 and ink 12.6:1 (both need 4.5:1 as text), and the palette
+# fills carry a surface-coloured separator rather than relying on hue contrast alone. Light
+# surface only -- these figures are written to disk and read alongside the other pipeline
+# PNGs, all of which commit to a white background.
 SURFACE = '#fcfcfb'
-SERIES = '#2a78d6'
+INK = '#2b2a26'           # the total, which must stay legible over any band beneath it
 INK_MUTED = '#52514e'
 GRID = '#d8d7d2'          # major rules, at the labelled ticks
 GRID_MINOR = '#ebeae6'    # minor rules, one per timestep -- must stay under the data
@@ -49,19 +60,54 @@ def aggregate(rows):
             np.array([by_t[t][2] for t in ts]))
 
 
-def plot_entry_counts(rows, out_path, radius, dt=0.5):
-    """Line+area of the total entering trajectories per timestep -> `out_path` (PNG).
+def aggregate_by_agent(rows):
+    """Per-agent entering counts on the common timestep axis.
 
-    Deliberately bare: the only prose is the two axis labels, so the figure drops into a
-    document that supplies its own caption. The numbers behind it go to CSV alongside
-    (`write_counts_csv`), which is where any per-timestep detail belongs.
+    Agents come and go over a run, so each series is zero-filled at the timesteps where its
+    agent was absent -- which is also what it means for the stack: an agent that is not
+    predicted contributes nothing. The series therefore sum to `aggregate`'s totals exactly.
 
-    Returns the path, or None if `rows` is empty."""
+    Returns (t, {agent_id: (T,) counts}) with the timesteps sorted.
+    """
+    ts = sorted({int(r['t']) for r in rows})
+    at = {t: i for i, t in enumerate(ts)}
+    per = {}
+    for r in rows:
+        s = per.get(r['agent'])
+        if s is None:
+            s = per[r['agent']] = np.zeros(len(ts), dtype=int)
+        s[at[int(r['t'])]] += int(r['n_enter'])
+    return np.array(ts), per
+
+
+def plot_entry_counts(rows, out_path, radius, dt=0.5, agent_colors=None):
+    """Per-agent stack + cumulative total of entering trajectories -> `out_path` (PNG).
+
+    Deliberately bare: the only prose is the two axis labels and the agent ids in the legend,
+    so the figure drops into a document that supplies its own caption. The numbers behind it
+    go to CSV alongside (`write_counts_csv`), which is where any per-timestep detail belongs.
+
+    :param agent_colors: {agent id: colour} -- which identity scheme the bands are drawn
+        under, from `visualization.colors` (`palette_for` to match the overlay video,
+        `junction_palette` to match the intersection investigation). Falls back to the
+        renderer's palette in the order agents appear in `rows`.
+    :return: the path, or None if `rows` is empty.
+    """
     if not rows:
         print('No risk rows to plot.')
         return None
     ts, enter, total, _ = aggregate(rows)
+    _, per_agent = aggregate_by_agent(rows)
     x = ts * dt                                        # timestep index -> seconds
+
+    # Agents that never enter the disc would be invisible bands with a legend entry each, so
+    # they are dropped: the legend then lists exactly the agents the figure shows. The rest
+    # stack biggest-first, which keeps the busiest band against the flat baseline.
+    if agent_colors is None:
+        order = {}
+        agent_colors = {r['agent']: color_for(r['agent'], order) for r in rows}
+    agents = sorted((a for a, s in per_agent.items() if s.any()),
+                    key=lambda a: -int(per_agent[a].sum()))
 
     fig, ax = plt.subplots(figsize=(11, 4.6))
     fig.patch.set_facecolor(SURFACE)
@@ -77,8 +123,27 @@ def plot_entry_counts(rows, out_path, radius, dt=0.5):
     # of the whole predicted distribution -- without a reference line to have to explain.
     ax.set_ylim(0, (total.max() if len(total) else 1) * 1.04)
 
-    ax.fill_between(x, enter, color=SERIES, alpha=0.16, lw=0, zorder=4)
-    ax.plot(x, enter, color=SERIES, lw=2.0, solid_capstyle='round', zorder=5)
+    if agents:
+        # Surface-coloured separators keep adjacent bands apart where two agents carry
+        # similar hues; the fills are dropped in opacity so the grid still reads through.
+        ax.stackplot(x, [per_agent[a] for a in agents], labels=[str(a) for a in agents],
+                     colors=[agent_colors[a] for a in agents],
+                     alpha=0.72, edgecolor=SURFACE, lw=0.6, zorder=4)
+    # The stack's top edge is the total by construction, so drawing it costs nothing and
+    # gives the scene-level series a hard line to be read off.
+    ax.plot(x, enter, color=INK, lw=1.6, solid_capstyle='round', label='total', zorder=6)
+
+    if agents:
+        handles, labels = ax.get_legend_handles_labels()
+        # Total first: it is the series the other entries decompose.
+        ordered = [(h, l) for h, l in zip(handles, labels) if l == 'total'] + \
+                  [(h, l) for h, l in zip(handles, labels) if l != 'total']
+        # Above the axes rather than inside them: a busy run fills the upper left, and a
+        # legend that has to dodge the data is a legend that sometimes lands on it.
+        ax.legend([h for h, _ in ordered], [l for _, l in ordered],
+                  loc='lower left', bbox_to_anchor=(0.0, 1.0), ncol=min(len(ordered), 7),
+                  fontsize=9, frameon=False, handlelength=1.4, handleheight=0.9,
+                  columnspacing=1.4, borderpad=0.0, labelcolor=INK_MUTED)
 
     ax.set_xlim(x[0], x[-1])
     ax.set_xlabel('simulation time [s]', fontsize=10, color=INK_MUTED)

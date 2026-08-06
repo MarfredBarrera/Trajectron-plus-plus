@@ -1,0 +1,43 @@
+# Isolated investigation of what the predictions actually are, at the four-way intersection
+# around (155, 70) where the ego meets vehicles -24740 and -23642.
+#
+# Same scene/model/horizon as configs/sweep_s1_rail_online.yaml, so anything seen here also
+# holds for the normal online run. Two deliberate differences:
+#   * ego_conditioning stays false, so the ego is NOT a node in the interaction graph -- the
+#     agents' predictions are a function of each other and of the map alone. That is the
+#     "ignoring the ego agent" setting the investigation asks for.
+#   * the run is launched with --style both, so every frame carries the analytic GMM
+#     (dist_mus / dist_covs / dist_pis) alongside the Monte Carlo samples. The Gaussian
+#     propagation figures are drawn from the GMM; the samples are kept only as a check that
+#     the analytic distribution and the sampled one agree.
+#
+# Predict-and-store only (no_viz); src/investigations/gaussian_propagation.py renders.
+data_dir: unity_data/sweep_s1_rail
+
+model_dir: ../nuScenes/models/int_ee_me
+model_ts: 12
+
+stride: 5
+ph: 10
+num_samples: 1000
+
+ego_frame: true
+zoom: 100.0
+fps: 2.0
+
+out_dir: unity_out/intersection_probe
+pred_file: null            # -> unity_out/intersection_probe/predictions_online.pkl
+save_env: false
+no_viz: true
+
+map_png: unity_maps/Demo_drivable.png
+map_json: unity_maps/Demo_drivable.json
+map_for_model: true
+
+# --- online ---------------------------------------------------------------- #
+warmup_timesteps: 1
+min_history_timesteps: 1
+ego_conditioning: false    # the ego is not in the scene graph; agents are predicted without it
+ego_path_mode: logged      # stored for context only
+risk_radius: 25.0
+risk_file: null

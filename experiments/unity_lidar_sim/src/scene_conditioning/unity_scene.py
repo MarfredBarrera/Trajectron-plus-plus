@@ -71,6 +71,14 @@ DEFAULT_CONFIG = {
     # the proximity gate (e.g. when no poses.csv is available it is skipped anyway).
     'ego_radius': 150.0,
     'min_motion': 1.0,
+    # Causal constant-velocity prefilter on VEHICLE tracks (see cv_filter_tracks): at each
+    # timestep the last `cv_filter_window` positions are fit by least squares and the model
+    # is handed the fit's position and velocity with a zero acceleration, instead of a raw
+    # second difference of position. 0 or null = off (raw differences, the original
+    # behaviour). This is the flicker lever: it removes the channel the horizon squares.
+    # Keep the window short -- a long one fits a straight line through a turning vehicle and
+    # costs accuracy; 3 is the measured sweet spot, and above ~9 it is clearly harmful.
+    'cv_filter_window': 0,
     # --- online run + risk scoring -------------------------------------------- #
     # Timesteps streamed into the encoders before the first prediction, which lands at
     # warmup_timesteps + 1. Longer warm-up = each agent's LSTM has more context at the
@@ -140,58 +148,119 @@ standardization = {
 # --------------------------------------------------------------------------- #
 # 1. Read unity ground-truth tracks                                            #
 # --------------------------------------------------------------------------- #
-def load_gt_tracks(gt_json_path, stride):
-    """Read gt_agents.json -> per-agent contiguous tracks resampled to 2 Hz.
+def _longest_time_run(t, max_gap):
+    """Slice of the longest stretch of `t` with no gap wider than `max_gap`."""
+    breaks = np.flatnonzero(np.diff(t) > max_gap) + 1
+    segments = np.split(np.arange(t.size), breaks)
+    return max(segments, key=len)
+
+
+def load_gt_tracks(gt_json_path, stride, target_dt=dt):
+    """Read gt_agents.json -> per-agent tracks on an exact `target_dt` grid.
 
     gt_agents.json is a time-ordered list of per-frame dicts with 'vehicles' and
-    'agents' (pedestrians) lists; each entry has id/type/cx/cy/yaw (map frame).
-    We index frames by their position in the list, keep every `stride`-th frame
-    (the source is ~10 Hz -> stride 5 gives the 2 Hz the model expects), dedup
-    repeated (frame,id) rows, and for each agent keep its longest contiguous run.
+    'agents' (pedestrians) lists; each entry has id/type/cx/cy/yaw (map frame), and
+    each frame carries the sim clock in `t_ns`.
 
-    Returns: list of dicts {id, type, first_timestep, x, y, heading} and the total
-    number of resampled timesteps.
+    Resampling is done in TIME, not by index. The source runs at a nominal 10 Hz but
+    the actual spacing jitters (measured on sweep_s1_rail: taking every 5th frame gives
+    0.5177 +/- 0.0272 s, not 0.5). Everything downstream -- `derivative_of`, the model's
+    velocity and acceleration inputs, the dynamics -- assumes a uniform `dt`, so feeding
+    it irregularly spaced samples labelled as uniform manufactures acceleration that the
+    agent never had: at 5 m/s, 27 ms of timing jitter reads as 0.13 m of position error,
+    and a second difference turns that into ~1 m/s^2 of pure noise. It also put a 3.5%
+    bias on every speed. So each agent's x/y/yaw are interpolated onto a grid that really
+    is `target_dt` apart, which is the interval the rest of the pipeline claims it is.
+
+    `stride` is the legacy index-striding rate, kept only for logs written without
+    `t_ns`; when timestamps are present it is unused.
+
+    Returns: list of dicts {id, type, first_timestep, x, y, heading}, the number of
+    timesteps on the grid, and the grid's sim-clock times in ns.
     """
     frames = json.load(open(gt_json_path))
+    if not frames:
+        return [], 0, np.empty(0, dtype=np.int64)
+
+    if not all('t_ns' in f for f in frames):
+        print('  WARNING: gt_agents.json has no t_ns; falling back to index striding, '
+              'which assumes the source rate is exactly uniform')
+        return _load_gt_tracks_by_index(frames, stride)
+
+    frames = sorted(frames, key=lambda f: f['t_ns'])
+    t_frame = np.array([f['t_ns'] for f in frames], dtype=np.int64) / 1e9
+    raw_dt = float(np.median(np.diff(t_frame))) if len(t_frame) > 1 else target_dt
+
+    # the uniform grid the model will believe it is being fed
+    n_steps = int(np.floor((t_frame[-1] - t_frame[0]) / target_dt)) + 1
+    grid = t_frame[0] + np.arange(n_steps) * target_dt
+    timestep_t_ns = np.round(grid * 1e9).astype(np.int64)
+
+    agents = {}   # id -> {'type': str, 'samples': {t_s: (x, y, yaw)}}
+    for f, t_s in zip(frames, t_frame):
+        for key, ntype in (('vehicles', 'VEHICLE'), ('agents', 'PEDESTRIAN')):
+            for a in f.get(key) or []:
+                rec = agents.setdefault(a['id'], {'type': ntype, 'samples': {}})
+                rec['samples'].setdefault(t_s, (a['cx'], a['cy'], a.get('yaw', 0.0)))
+
+    tracks = []
+    for aid, rec in agents.items():
+        t_a = np.array(sorted(rec['samples'].keys()), dtype=float)
+        if t_a.size < 2:
+            continue
+        # Only a gap wider than one OUTPUT step means the agent really dropped out --
+        # bridging it would invent motion, so the longest continuous stretch is used.
+        # The threshold is deliberately not tied to the source rate: this log drops the
+        # odd frame globally (0.26 s hiccups on a 0.10 s nominal period) and splitting a
+        # track there would discard most of it for no reason.
+        seg = _longest_time_run(t_a, target_dt)
+        t_seg = t_a[seg]
+        if t_seg.size < 2:
+            continue
+        xyz = np.array([rec['samples'][t] for t in t_seg], dtype=float)
+        inside = np.flatnonzero((grid >= t_seg[0]) & (grid <= t_seg[-1]))
+        if inside.size < 2:
+            continue
+        g = grid[inside]
+        # yaw is unwrapped before interpolation so a track crossing +-pi does not spin
+        yaw = np.interp(g, t_seg, np.unwrap(xyz[:, 2]))
+        tracks.append({'id': str(aid), 'type': rec['type'],
+                       'first_timestep': int(inside[0]),
+                       'x': np.interp(g, t_seg, xyz[:, 0]),
+                       'y': np.interp(g, t_seg, xyz[:, 1]),
+                       'heading': (yaw + np.pi) % (2.0 * np.pi) - np.pi})
+    return tracks, n_steps, timestep_t_ns
+
+
+def _load_gt_tracks_by_index(frames, stride):
+    """The pre-timestamp loader: keep every `stride`-th frame and assume it is uniform.
+
+    Only reached for logs with no `t_ns`. It cannot correct spacing it cannot see, so it
+    inherits whatever jitter the source had -- see `load_gt_tracks` for what that costs.
+    """
     kept = frames[::stride]
     n_kept = len(kept)
-    timestep_t_ns = np.array([f['t_ns'] for f in kept], dtype=np.int64)   # sim clock per timestep
-    # gather per-agent rows keyed by the resampled timestep index
+    timestep_t_ns = np.array([f.get('t_ns', 0) for f in kept], dtype=np.int64)
     agents = {}   # id -> {'type': str, 'rows': {t: (x, y, yaw)}}
     for new_t, f in enumerate(kept):
         for key, ntype in (('vehicles', 'VEHICLE'), ('agents', 'PEDESTRIAN')):
             for a in f.get(key) or []:
-                aid = a['id']
-                rec = agents.setdefault(aid, {'type': ntype, 'rows': {}})
-                if new_t in rec['rows']:
-                    continue  # dedup repeated per-frame stamps
-                rec['rows'][new_t] = (a['cx'], a['cy'], a.get('yaw', 0.0))
+                rec = agents.setdefault(a['id'], {'type': ntype, 'rows': {}})
+                rec['rows'].setdefault(new_t, (a['cx'], a['cy'], a.get('yaw', 0.0)))
 
     tracks = []
     for aid, rec in agents.items():
-        ts = sorted(rec['rows'].keys())
-        if len(ts) < 2:
+        ts = np.array(sorted(rec['rows'].keys()))
+        if ts.size < 2:
             continue
-        # longest contiguous run of timesteps
-        best_start, best_len = ts[0], 1
-        run_start, run_len = ts[0], 1
-        for i in range(1, len(ts)):
-            if ts[i] == ts[i - 1] + 1:
-                run_len += 1
-            else:
-                if run_len > best_len:
-                    best_start, best_len = run_start, run_len
-                run_start, run_len = ts[i], 1
-        if run_len > best_len:
-            best_start, best_len = run_start, run_len
-        if best_len < 2:
+        run = _longest_time_run(ts.astype(float), 1.0)     # contiguous timestep indices
+        if run.size < 2:
             continue
-        run_ts = list(range(best_start, best_start + best_len))
-        xy = np.array([rec['rows'][t][:2] for t in run_ts], dtype=float)
-        yaw = np.array([rec['rows'][t][2] for t in run_ts], dtype=float)
-        yaw = (yaw + np.pi) % (2.0 * np.pi) - np.pi   # normalize to [-pi, pi]
-        tracks.append({'id': str(aid), 'type': rec['type'], 'first_timestep': best_start,
-                       'x': xy[:, 0], 'y': xy[:, 1], 'heading': yaw})
+        run_ts = ts[run]
+        xyz = np.array([rec['rows'][t] for t in run_ts], dtype=float)
+        tracks.append({'id': str(aid), 'type': rec['type'], 'first_timestep': int(run_ts[0]),
+                       'x': xyz[:, 0], 'y': xyz[:, 1],
+                       'heading': (xyz[:, 2] + np.pi) % (2.0 * np.pi) - np.pi})
     return tracks, n_kept, timestep_t_ns
 
 
@@ -242,6 +311,57 @@ def filter_tracks(tracks, timestep_t_ns, ego_t, ego_xy, ego_yaw,
     return kept
 
 
+def cv_filter_tracks(tracks, window, dt_s=dt):
+    """Causal constant-velocity prefilter over each VEHICLE track, in place.
+
+    At every timestep i, fit p(tau) = p0 + v*tau by least squares to the positions in
+    [i-window+1, i] and keep the fit's value and slope AT i. Only past samples are used, so
+    this is something an online state estimator could actually produce; it is not smoothing
+    with hindsight.
+
+    Why it exists: `src/investigations/synthetic_input.py` shows the prediction flicker is
+    bought entirely with input position noise, because the acceleration the model reads is a
+    raw second difference and 0.5*a*T^2 magnifies it. Handing the model the fitted velocity
+    and a zero acceleration instead removes the amplified channel at the source. The track's
+    `cv_state` entry is what `make_node` then uses in place of the finite differences.
+
+    The trade is real and window-dependent: constant velocity is a *model* of the agent, and
+    a long window fits a straight line through a braking, turning vehicle. Measured
+    rolling-fit residual RMS on these tracks is 0.25 / 0.58 / 0.91 m at window 5 / 9 / 13
+    against a ~0.13 m noise floor, so past ~5 the fit is discarding real motion. Short
+    windows are the usable range; see the module docstring of investigations/cv_prefilter.py
+    for the accuracy measurements behind that.
+    """
+    if not window or window < 2:
+        return tracks
+    for tr in tracks:
+        if tr['type'] != 'VEHICLE':
+            continue                       # pedestrians are not constant-velocity in any useful sense
+        pos = np.stack((tr['x'], tr['y']), axis=-1)
+        n = len(pos)
+        fit_pos = np.array(pos, dtype=float)
+        fit_vel = np.zeros_like(fit_pos)
+        for i in range(n):
+            lo = max(0, i - window + 1)
+            seg = pos[lo:i + 1]
+            if len(seg) < 2:
+                continue
+            tau = np.arange(len(seg)) * dt_s
+            A = np.stack([np.ones(len(seg)), tau], axis=1)
+            coef, *_ = np.linalg.lstsq(A, seg, rcond=None)
+            fit_pos[i] = coef[0] + coef[1] * tau[-1]
+            fit_vel[i] = coef[1]
+        # heading follows the fitted velocity while the agent is moving; below that the
+        # direction of a near-zero vector is meaningless, so the logged heading stands
+        speed = np.linalg.norm(fit_vel, axis=-1)
+        heading = np.where(speed > 1.0, np.arctan2(fit_vel[:, 1], fit_vel[:, 0]),
+                           tr['heading'])
+        tr['x'], tr['y'] = fit_pos[:, 0], fit_pos[:, 1]
+        tr['heading'] = np.unwrap(heading)
+        tr['cv_state'] = fit_vel
+    return tracks
+
+
 # --------------------------------------------------------------------------- #
 # 2. Build a Trajectron++ Scene/Environment (mirrors process_data.process_scene)#
 # --------------------------------------------------------------------------- #
@@ -266,10 +386,16 @@ def make_node(env, tr, x_min, y_min, is_robot=False):
     """
     x = tr['x'] - x_min
     y = tr['y'] - y_min
-    vx = derivative_of(x, dt)
-    vy = derivative_of(y, dt)
-    ax = derivative_of(vx, dt)
-    ay = derivative_of(vy, dt)
+    if 'cv_state' in tr:
+        # prefiltered: velocity is the fit's slope and the acceleration channel -- the one
+        # the horizon squares -- is exactly zero, rather than a second difference of noise
+        vx, vy = tr['cv_state'][:, 0], tr['cv_state'][:, 1]
+        ax = ay = np.zeros_like(vx)
+    else:
+        vx = derivative_of(x, dt)
+        vy = derivative_of(y, dt)
+        ax = derivative_of(vx, dt)
+        ay = derivative_of(vy, dt)
 
     if tr['type'] == 'VEHICLE':
         heading = tr['heading']
@@ -516,7 +642,8 @@ class UnityScene(object):
                 'num_samples': self.cfg['num_samples'], 'x_min': self.x_min, 'y_min': self.y_min,
                 'xlim': (all_x.min() - 15, all_x.max() + 15),
                 'ylim': (all_y.min() - 15, all_y.max() + 15),
-                'zoom': self.cfg['zoom'], 'gif_prefix': 'distribution'}
+                'zoom': self.cfg['zoom'], 'gif_prefix': 'distribution',
+                'cv_filter_window': self.cfg.get('cv_filter_window') or 0}
         if self.map_bounds is not None:
             meta['map_png'] = os.path.abspath(self.cfg['map_png'])
             meta['map_bounds'] = self.map_bounds
@@ -562,6 +689,11 @@ def prepare_scene(cfg):
     print(f'  {len(tracks)}/{n_before} tracks kept after filtering (near-ego + moving)')
     if not tracks:
         raise SystemExit('no tracks left after filtering -- loosen ego_radius / min_motion')
+
+    if cfg.get('cv_filter_window'):
+        cv_filter_tracks(tracks, int(cfg['cv_filter_window']))
+        print(f'  constant-velocity prefilter on VEHICLE tracks, '
+              f'window {cfg["cv_filter_window"]} frames')
 
     bounds = scene_bounds(tracks)
     x_min, y_min, x_max, y_max = bounds

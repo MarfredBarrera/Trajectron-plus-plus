@@ -6,7 +6,7 @@ built from the recorded run rather than from anything recomputed afterwards.
 
 Bundle format (pickle):
     {'meta':  {source, scene, dt, ph, num_samples, x_min, y_min, xlim, ylim,
-               zoom, gif_prefix, risk_radius},
+               zoom, gif_prefix, risk_radius, dynamic},
      'frames': [ {'t': int,
                   'ego': [[ex, ey], yaw] or None,      # world coords; enables ego view
                   'ego_path': [[x, y], ...] or None,   # context only; the metric ignores it
@@ -14,9 +14,18 @@ Bundle format (pickle):
                               'history' (H,2), 'future' (F,2),
                               'samples' (S,ph,2), 'ml' (ph,2),
                               'dist_mus' (ph,K,2), 'dist_covs' (ph,K,2,2), 'dist_pis' (ph,K),
+                              'ctrl_mus' (ph,K,2), 'ctrl_covs' (ph,K,2,2),
                               # risk, as scored online at this timestep (risk_eval.proximity):
                               'risk_enter' (S,) bool, 'risk_dist_now', 'risk_min_dist'},
                              ... ]}, ... ]}
+
+`dist_*` is the predicted distribution over POSITIONS; `ctrl_*` is the same mixture one step
+upstream, over the CONTROLS the decoder actually emits -- (heading rate, acceleration) for a
+Unicycle agent, acceleration (x, y) for a SingleIntegrator one. Integrating a mixture through
+the dynamics moves its components without reweighting them, so the control mixture's weights
+are `dist_pis` and are not stored twice. `meta['dynamic']` carries the model's per-node-type
+dynamics config, limits included, so a consumer can interpret and bound those axes without
+loading the checkpoint.
 
 The `risk_*` fields are what makes the visualizers pure consumers: `risk_enter` says which
 samples entered the ego's disc, which the per-agent CSV cannot express. A bundle written

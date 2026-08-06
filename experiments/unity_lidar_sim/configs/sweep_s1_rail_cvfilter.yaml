@@ -1,0 +1,47 @@
+# sweep_s1_rail with the causal constant-velocity prefilter on the VEHICLE tracks.
+#
+# Identical to configs/sweep_s1_rail_online.yaml in every other respect, so this run and that
+# one differ by the filter alone and their bundles can be compared directly. The filter fits
+# the last `cv_filter_window` positions by least squares at every timestep and hands the model
+# the fit's position and velocity with a zero acceleration, instead of a raw second difference
+# of position -- see unity_scene.cv_filter_tracks and investigations/cv_prefilter.py.
+#
+# Window 3 is deliberate. Flicker keeps falling as the window grows, but so does accuracy: a
+# long window fits a straight line through a vehicle that is braking into a turn, which most
+# of these agents are doing. 3 is the shortest window that still averages any noise, and is
+# where the measured accuracy cost is smallest.
+#
+# no_viz is off here, so this renders as it predicts:
+#   python src/unity_online.py --config configs/sweep_s1_rail_cvfilter.yaml --gpu 0 --format both
+data_dir: unity_data/sweep_s1_rail
+
+model_dir: ../nuScenes/models/int_ee_me
+model_ts: 12
+
+stride: 5
+ph: 10
+num_samples: 1000
+
+ego_frame: true
+zoom: 100.0
+fps: 2.0
+
+out_dir: unity_out/sweep_s1_rail_cvfilter
+pred_file: null            # -> unity_out/sweep_s1_rail_cvfilter/predictions_online.pkl
+save_env: false
+no_viz: false              # predict and render in one pass
+
+map_png: unity_maps/Demo_drivable.png
+map_json: unity_maps/Demo_drivable.json
+map_for_model: false
+
+# --- the filter ------------------------------------------------------------- #
+cv_filter_window: 3        # 0 = off (raw finite differences, as in the other configs)
+
+# --- online ----------------------------------------------------------------- #
+warmup_timesteps: 1
+min_history_timesteps: 1
+ego_path_mode: logged
+ego_conditioning: false
+risk_radius: 25.0
+risk_file: null
